@@ -43,6 +43,13 @@ TOOL_ITEMS = [
         'GREASEPENCIL',
         2,
     ),
+    (
+        'ANGLED',
+        "Angled Cut",
+        "Click points to lay down linked plane segments: one angled cut surface with hard edges",
+        'MOD_EDGESPLIT',
+        3,
+    ),
 ]
 
 SURFACE_ORIGIN_ITEMS = [

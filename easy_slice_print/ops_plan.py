@@ -36,6 +36,7 @@ class ESP_OT_new_cut(bpy.types.Operator):
             'STRAIGHT': bpy.ops.esp.cut_straight,
             'CURVED': bpy.ops.esp.cut_curved,
             'FREEHAND': bpy.ops.esp.cut_freehand,
+            'ANGLED': bpy.ops.esp.cut_angled,
         }[tool]
         return op('INVOKE_DEFAULT')
 

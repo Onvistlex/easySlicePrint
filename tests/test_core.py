@@ -117,6 +117,43 @@ def test_straight_cut_with_pin():
     return obj
 
 
+def test_angled_cut():
+    print("== angled cut (linked plane segments, hard creases)")
+    reset_scene()
+    obj = make_cylinder()
+    vol0 = mesh_utils.mesh_volume(obj.data)
+    # a V drawn across the cylinder as seen from +X: two segments that meet at a hard
+    # crease, each taking its plane from its own segment (segment x view direction)
+    points = [Vector((0, -22, 12)), Vector((0, 0, -4)), Vector((0, 22, 12))]
+    view = Vector((-1, 0, 0))
+    built = plan.angled_surface(bpy.context, obj, points, view)
+    check(built is not None, "angled surface built from the two segments")
+    pv, pf, cv, cf, skipped = built
+    check(len(cf) == 2, f"one flat cutter quad per segment ({len(cf)} faces)")
+    n0 = surfaces.patch_normal(cv, [cf[0]])
+    n1 = surfaces.patch_normal(cv, [cf[1]])
+    check(n0.dot(n1) < 0.999, f"the two segment planes really are at an angle ({n0.dot(n1):.3f})")
+
+    spec = cutting.CutSpec(contacts=[cutting.ContactSpec(cv, cf, add_pin=False)], gap=0.2)
+    a, b, secs = cutting.perform_cut(bpy.context, obj, spec, ("UP", "DOWN"), out_collection("out"))
+    print(f"  cut took {secs:.2f}s, A faces={len(a.data.polygons)} B faces={len(b.data.polygons)}")
+    check(is_closed_manifold(a.data), "part A closed manifold")
+    check(is_closed_manifold(b.data), "part B closed manifold")
+    va, vb = mesh_utils.mesh_volume(a.data), mesh_utils.mesh_volume(b.data)
+    check(abs((va + vb) - vol0) < vol0 * 0.01, f"volume conserved ({va + vb:.0f} vs {vol0:.0f})")
+
+    # the crease dips to the middle point, so the part that sits above the seam is
+    # lowest at y=0: a flat plane would leave it at the same height for +y and -y
+    ca, cb = mesh_utils.mesh_centroid(a.data), mesh_utils.mesh_centroid(b.data)
+    upper, lower = (a, b) if ca.z > cb.z else (b, a)
+    up = upper.data.vertices
+    z_mid = min((v.co.z for v in up if abs(v.co.y) < 2.0), default=None)
+    z_side = min((v.co.z for v in up if abs(v.co.y) > 8.0), default=None)
+    check(z_mid is not None and z_side is not None, "the upper part has vertices over the whole seam")
+    check(z_mid < z_side - 1.0, f"the seam is angled, not flat (mid z {z_mid:.1f} < side z {z_side:.1f})")
+    return obj
+
+
 def test_ribbon_cut():
     print("== curved (ribbon) cut")
     reset_scene()
@@ -1240,6 +1277,7 @@ def test_ribbon_follows_a_silhouette():
 if __name__ == "__main__":
     t = time.time()
     test_straight_cut_with_pin()
+    test_angled_cut()
     test_ribbon_cut()
     test_loop_cut()
     test_smooth_surfaces()

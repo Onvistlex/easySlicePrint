@@ -802,7 +802,110 @@ class ESP_OT_cut_freehand(CutToolBase, bpy.types.Operator):
             draw.circle_2d(start2d, self.CLOSE_PX, color)
 
 
-CLASSES = (ESP_OT_cut_straight, ESP_OT_cut_curved, ESP_OT_cut_freehand)
+class ESP_OT_cut_angled(CutToolBase, bpy.types.Operator):
+    bl_idname = "esp.cut_angled"
+    bl_label = "Angled Cut"
+    bl_description = (
+        "Click points across the model to lay linked plane segments. Each segment is a flat cut "
+        "through the model and the segments share their edges, so the cut is one angled surface "
+        "with hard creases - the plane cut's flatness, bent where you need it"
+    )
+    kind = 'ANGLED'
+    cursor = CURSOR_CUT
+
+    def reset_stroke(self):
+        CutToolBase.reset_stroke(self)
+        self.points = []  # world points, one per click
+        self.points2d = []  # the same points in region space, for the overlay
+        self.pts_view = None  # view direction captured at the first click
+        self.first_hit = None
+
+    def status_text(self):
+        return (
+            "LMB click: add a point | Enter: finish | Backspace: remove last point | RMB / Esc: cancel"
+        )
+
+    def header_text(self):
+        segments = max(0, len(self.points) - 1)
+        return f"Angled Cut - {len(self.points)} point(s), {segments} segment(s)"
+
+    def on_press(self, context, c):
+        if self.points and self.view_moved():
+            self.report({'WARNING'}, "View orbited - draw the angled cut from a single view")
+            self.reset_stroke()
+            self.update_status(context)
+            return None
+        if not self.points:
+            # every segment takes its plane from this first view, exactly as a plane cut
+            # does; orbiting away from it would silently change what the clicks mean
+            self.view_at_press = self.view_key()
+            self.pts_view = self.view_dir(c)
+        hit, loc, _nor, _dist = self.cast(context, c)
+        if hit:
+            p = loc
+            if self.first_hit is None:
+                self.first_hit = loc
+        else:
+            p = self.at_depth(c, self.bcenter)
+        if self.points and (p - self.points[-1]).length < self.diag * 0.002:
+            return None
+        self.points.append(p)
+        self.points2d.append(c)
+        self.update_status(context)
+        return None
+
+    def on_confirm(self, context):
+        if len(self.points) < 2:
+            self.report({'WARNING'}, "Add at least two points (one segment) before finishing")
+            return None
+        return self.make_contact(context)
+
+    def on_key(self, context, event):
+        if event.type == 'BACK_SPACE' or (event.type == 'Z' and event.ctrl):
+            if self.points:
+                self.points.pop()
+                self.points2d.pop()
+                if not self.points:
+                    self.first_hit = None
+                self.update_status(context)
+        return None
+
+    def make_contact(self, context):
+        if self.view_moved():
+            self.report({'WARNING'}, "View orbited - draw the angled cut from a single view")
+            return None
+        built = plan.angled_surface(context, self.target, self.points, self.pts_view, self.first_hit)
+        if built is None:
+            self.report({'WARNING'}, "Nothing to cut: the segments do not cross the model")
+            return None
+        pv, pf, cv, cf, skipped = built
+        data = plan.ContactData('ANGLED')
+        data.points = [p.copy() for p in self.points]
+        data.view_dir = self.pts_view
+        data.verts, data.faces = pv, pf
+        data.cutter = (cv, cf)
+        data.regions_skipped = skipped
+        # a bent surface is not one flat printed face, so the connector is estimated by
+        # rays (against the strip it sits on) rather than by an inscribed circle
+        data.is_cut_face = False
+        if self.first_hit is not None:
+            data.hit = self.first_hit
+            data.through = self.pts_view
+            data.anchor = self.first_hit
+        else:
+            data.center_hint = sum(self.points, Vector((0.0, 0.0, 0.0))) / len(self.points)
+            data.anchor = self.points[0]
+        return self.contact_done(context, data)
+
+    def draw(self, context):
+        if len(self.points2d) >= 2:
+            draw.lines_2d(self.points2d, draw.GREEN, 2.5)
+        if self.points2d:
+            draw.lines_2d([self.points2d[-1], self.mouse], draw.DIM, 1.0)
+        draw.points_2d(self.points2d, draw.WHITE, 7.0)
+
+
+CLASSES = (ESP_OT_cut_straight, ESP_OT_cut_curved, ESP_OT_cut_freehand, ESP_OT_cut_angled)
 
 
 def register():

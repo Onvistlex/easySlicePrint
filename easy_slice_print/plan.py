@@ -18,7 +18,12 @@ BACKUP_COLLECTION = "ESP_Backup"
 BUILT_PREFIX = "ESP_Built_"
 GREEN = (0.30, 0.90, 0.40, 0.40)
 ORANGE = (1.00, 0.55, 0.15, 0.85)
-PREFIX = {'STRAIGHT': "Plane Cut", 'CURVED': "Curve Cut", 'FREEHAND': "Freehand Cut"}
+PREFIX = {
+    'STRAIGHT': "Plane Cut",
+    'CURVED': "Curve Cut",
+    'FREEHAND': "Freehand Cut",
+    'ANGLED': "Angled Cut",
+}
 
 _suspend = 0
 
@@ -224,6 +229,107 @@ def fill_straight_contact(data, patch, span):
     data.span = span
     data.is_cut_face = True
     data.regions_skipped = patch.islands - patch.kept
+
+
+def angled_surface(context, target, points, view_dir, reference=None):
+    """One cut surface made of linked plane segments (hard edges, no rounding).
+
+    Each drawn segment defines a plane exactly like a Plane cut - the segment and the
+    view direction span it - and the model is sectioned on that plane. The sections are
+    laid end to end, each keeping its own plane, so the cut comes out with creases where
+    the drawn line bends and is otherwise as flat as a plane cut. The whole thing is one
+    surface: subtracting its kerf splits the model in two along an angled seam, which is
+    what a chain of separate Plane records cannot do (they leave extra parts).
+
+    Segment normals are oriented consistently (each agrees with the first), so "side A"
+    means the same side along the whole surface. -> (preview_v, preview_f, cutter_v,
+    cutter_f, skipped) or None. The preview is what the user sees; the cutter is the
+    per-segment quad that reaches past the model, as in a single plane cut.
+    """
+    if target is None or len(points) < 2:
+        return None
+    d = Vector(view_dir).normalized()
+    pts = [Vector(p) for p in points]
+    clean = [pts[0]]
+    for p in pts[1:]:
+        if (p - clean[-1]).length > 1e-6:
+            clean.append(p)
+    pts = clean
+    if len(pts) < 2:
+        return None
+    mn, mx = mesh_utils.object_world_bounds(target)
+    diag = max((mx - mn).length, 1e-6)
+    reach = diag * 1.5  # far enough along the view direction to leave the model behind
+    # a hair past the model at both ends, so the wall reaches past it there too
+    trim = diag * 0.02
+    pts[0] = pts[0] - (pts[1] - pts[0]).normalized() * trim
+    pts[-1] = pts[-1] + (pts[-1] - pts[-2]).normalized() * trim
+
+    # one plane normal per segment, all pointing to the same side ("A")
+    axes = []
+    normals = []
+    flip = []
+    base_n = None
+    for i in range(len(pts) - 1):
+        axis = (pts[i + 1] - pts[i]).normalized()
+        n = axis.cross(d)
+        if n.length < 1e-9:  # a segment drawn along the view direction has no plane
+            axes.append(None)
+            normals.append(None)
+            flip.append(False)
+            continue
+        n.normalize()
+        f = False
+        if base_n is None:
+            base_n = n.copy()
+        elif n.dot(base_n) < 0.0:
+            n = -n
+            f = True
+        axes.append(axis)
+        normals.append(n)
+        flip.append(f)
+
+    # the cutter: the strip each segment sweeps along the view direction. The two rails
+    # of the strip are shared between neighbours, so the wall is one continuous bent sheet.
+    cv = []
+    ni = []
+    fi = []
+    for p in pts:
+        ni.append(len(cv))
+        cv.append(p - d * reach)
+        fi.append(len(cv))
+        cv.append(p + d * reach)
+    cf = []
+    for i in range(len(pts) - 1):
+        if normals[i] is None:
+            continue
+        if flip[i]:
+            cf.append((ni[i], fi[i], fi[i + 1], ni[i + 1]))
+        else:
+            cf.append((ni[i], ni[i + 1], fi[i + 1], fi[i]))
+
+    # the visible cut face: the model's own cross section on each segment's plane
+    pv, pf = [], []
+    skipped = 0
+    for i in range(len(pts) - 1):
+        if normals[i] is None:
+            continue
+        axis = axes[i]
+        n = normals[i]
+        a, b = pts[i], pts[i + 1]
+        c = (a + b) * 0.5
+        half = (b - a).length * 0.5
+        patch = straight_section(context, target, c, n, (axis, -half, half),
+                                 reference if reference is not None else c)
+        if patch is None:
+            continue
+        base = len(pv)
+        pv.extend(Vector(v) for v in patch[0])
+        pf.extend(tuple(base + idx for idx in f) for f in patch[1])
+        skipped += int(patch.islands - patch.kept)
+    if not cf or not pf:
+        return None
+    return pv, pf, cv, cf, skipped
 
 
 # ----------------------------------------------------------------------------
@@ -676,6 +782,23 @@ def rebuild_surface(obj, draft=False, context=None, target=None):
         verts = [inv @ Vector(v) for v in verts]
         if not draft:
             set_cutter(obj, [inv @ Vector(p) for p in cutter[0]] if cutter else None, cutter)
+    elif kind == 'ANGLED' and len(pts) >= 2:
+        # the points are local; the stored view direction is world. The surface is one
+        # plane per drawn segment, so it is rebuilt by re-sectioning the model on each
+        # of those planes, exactly as a plane cut is.
+        if context is None or target is None:
+            return
+        mw = obj.matrix_basis
+        world_view = Vector(obj["esp_view"]).normalized()
+        built = angled_surface(context, target, [mw @ p for p in pts], world_view)
+        if built is None:
+            return
+        pv, pf, cv, cf, skipped = built
+        inv = mw.inverted_safe()
+        verts = [inv @ v for v in pv]
+        faces = pf
+        set_cutter(obj, [inv @ Vector(p) for p in cv] if cv else None, (cv, cf) if cv else None)
+        obj["esp_skipped"] = skipped
     elif kind == 'STRAIGHT':
         patch = rebuilt_section(obj, context, target)
         if patch is None:

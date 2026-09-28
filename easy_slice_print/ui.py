@@ -86,9 +86,14 @@ class ESP_PT_tools(ESPPanel, bpy.types.Panel):
         row.scale_y = 1.4
         row.operator("esp.cut_straight", text="Plane", icon='MESH_PLANE', depress=s.tool == 'STRAIGHT')
         row.operator("esp.cut_curved", text="Curve", icon='CURVE_BEZCURVE', depress=s.tool == 'CURVED')
+        row = layout.row(align=True)
+        row.scale_y = 1.4
         row.operator("esp.cut_freehand", text="Freehand", icon='GREASEPENCIL', depress=s.tool == 'FREEHAND')
+        row.operator("esp.cut_angled", text="Angled", icon='MOD_EDGESPLIT', depress=s.tool == 'ANGLED')
         if s.tool == 'FREEHAND':
             layout.label(text="Orbit (MMB) between strokes to reach the far side", icon='INFO')
+        if s.tool == 'ANGLED':
+            layout.label(text="Click points; segments share edges: one angled cut", icon='INFO')
         col = layout.column(align=True)
         col.prop(s, "surface_margin", slider=True)
         if s.mode == 'PLAN':
@@ -97,7 +102,7 @@ class ESP_PT_tools(ESPPanel, bpy.types.Panel):
             # a traced loop keeps the points it was drawn through: Control Points is a
             # Curve setting, and smoothing is the one knob that rounds a traced detail off
             col.prop(s, "loop_smoothing", slider=True)
-        else:
+        elif s.tool != 'ANGLED':
             col.prop(s, "stroke_smoothing", slider=True)
             col.prop(s, "control_points")
         col.prop(s, "surface_detail")
