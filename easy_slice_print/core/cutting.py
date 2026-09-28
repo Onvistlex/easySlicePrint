@@ -22,9 +22,9 @@ class CutError(Exception):
 
 
 @dataclass
-class ContactSpec:
-    verts: list
-    faces: list
+class ConnectorSpec:
+    """One pin + socket on a cut surface. A contact can carry several."""
+
     add_pin: bool = True
     pin_matrix: Matrix | None = None  # world; +Z points into the socket part
     shape: str = 'CYLINDER'
@@ -33,14 +33,67 @@ class ContactSpec:
     # When set it is the shape that gets built; `shape`/`custom_obj` only say how to
     # make one from scratch, which is all Quick mode has.
     pin_mesh: object = None
-    regions_skipped: int = 0  # regions the plane crosses that this surface leaves uncut
-    # The surface the user sees, as (verts, faces), when `verts`/`faces` is a separate cutter
-    # (a plane's quad, a curve's flat ribbon, a loop's skirted membrane). A failed cut is
-    # diagnosed on the cutter but painted on this: it is the mesh on screen, and the one edited.
-    preview: tuple | None = None
+    # Overrides CutSpec.pin_side for this connector alone; None means use the cut's side.
+    pin_side: str | None = None
+
+
+class ContactSpec:
+    """One cut surface and the connector(s) sitting on it.
+
+    The first connector used to be the contact's own fields (`add_pin`, `pin_matrix`,
+    `shape`, `custom_obj`, `pin_mesh`). Those are still accepted positionally and read
+    back, so a single-connector caller is written exactly as before; `connectors` is the
+    full list, first connector first.
+    """
+
+    def __init__(
+        self,
+        verts,
+        faces,
+        add_pin=True,
+        pin_matrix=None,
+        shape='CYLINDER',
+        custom_obj=None,
+        pin_mesh=None,
+        regions_skipped=0,
+        preview=None,
+        connectors=None,
+    ):
+        self.verts = verts
+        self.faces = faces
+        self.regions_skipped = regions_skipped  # regions the plane crosses that this surface leaves uncut
+        # The surface the user sees, as (verts, faces), when `verts`/`faces` is a separate
+        # cutter (a plane's quad, a curve's flat ribbon, a loop's skirted membrane). A failed
+        # cut is diagnosed on the cutter but painted on this: it is the mesh on screen, and
+        # the one edited.
+        self.preview = preview
+        if connectors is None:
+            connectors = [ConnectorSpec(add_pin, pin_matrix, shape, custom_obj, pin_mesh)]
+        self.connectors = list(connectors)
 
     def shown_patch(self):
         return self.preview if self.preview is not None else (self.verts, self.faces)
+
+    # -- the first connector, for code that only ever had one ----------------
+    @property
+    def add_pin(self):
+        return self.connectors[0].add_pin if self.connectors else False
+
+    @property
+    def pin_matrix(self):
+        return self.connectors[0].pin_matrix if self.connectors else None
+
+    @property
+    def shape(self):
+        return self.connectors[0].shape if self.connectors else 'CYLINDER'
+
+    @property
+    def custom_obj(self):
+        return self.connectors[0].custom_obj if self.connectors else None
+
+    @property
+    def pin_mesh(self):
+        return self.connectors[0].pin_mesh if self.connectors else None
 
 
 @dataclass
@@ -254,31 +307,50 @@ def split_mesh(context, mesh, spec):
     return drain(split_mesh_steps(context, mesh, spec))
 
 
+def connector_items(spec):
+    """Every connector to build, as (contact, connector) pairs, in order."""
+    for c in spec.contacts:
+        for k in c.connectors:
+            if k.add_pin and k.pin_matrix is not None:
+                yield c, k
+
+
 def apply_connectors_steps(context, mesh_a, mesh_b, spec):
-    total = sum(1 for c in spec.contacts if c.add_pin and c.pin_matrix is not None)
+    items = list(connector_items(spec))
+    total = len(items)
     n = 0
     half = None  # first half finished; dropped if the job is cancelled between the two booleans
     try:
-        for c in spec.contacts:
-            if not c.add_pin or c.pin_matrix is None:
-                continue
+        for c, k in items:
             n += 1
+            side = k.pin_side or spec.pin_side
             yield f"adding connector {n}/{total}" if total > 1 else "adding the connector"
-            pin = connectors.connector_mesh(c.shape, c.custom_obj, c.pin_matrix, "_esp_pin", unit_mesh=c.pin_mesh)
+            pin = connectors.connector_mesh(k.shape, k.custom_obj, k.pin_matrix, "_esp_pin", unit_mesh=k.pin_mesh)
             socket = connectors.connector_mesh(
-                c.shape,
-                c.custom_obj,
-                c.pin_matrix,
+                k.shape,
+                k.custom_obj,
+                k.pin_matrix,
                 "_esp_socket",
                 radial_extra=spec.clearance,
                 tip_extra=spec.tip_extra,
-                unit_mesh=c.pin_mesh,
+                unit_mesh=k.pin_mesh,
             )
-            pin_target, socket_target = (mesh_a, mesh_b) if spec.pin_side == 'A' else (mesh_b, mesh_a)
+            pin_target, socket_target = (mesh_a, mesh_b) if side == 'A' else (mesh_b, mesh_a)
+            # A connector placed off the cut face lands in air: a union would add a floating
+            # pin and a difference comes back empty (which the boolean helper reports by
+            # returning nothing, wiping the part). Skip it, the same way a cut that carves
+            # nothing is not allowed to take the part with it.
+            if not mesh_utils.mesh_intersects(context, pin_target, pin, spec.solver):
+                for m in (pin, socket):
+                    mesh_utils.remove_mesh(m)
+                continue
             half = mesh_utils.boolean_mesh(context, pin_target, pin, 'UNION', spec.solver)
             yield f"carving socket {n}/{total}" if total > 1 else "carving the socket"
-            carved = mesh_utils.boolean_mesh(context, socket_target, socket, 'DIFFERENCE', spec.solver)
-            new_a, new_b = (half, carved) if spec.pin_side == 'A' else (carved, half)
+            if mesh_utils.mesh_intersects(context, socket_target, socket, spec.solver):
+                carved = mesh_utils.boolean_mesh(context, socket_target, socket, 'DIFFERENCE', spec.solver)
+            else:  # the pin did not reach the other part: keep it whole rather than emptying it
+                carved = mesh_utils.mesh_copy(socket_target, socket_target.name + "_sock_skip")
+            new_a, new_b = (half, carved) if side == 'A' else (carved, half)
             half = None
             for m in (pin, socket, mesh_a, mesh_b):
                 mesh_utils.remove_mesh(m)

@@ -112,17 +112,118 @@ class ESP_OT_select_pin(bpy.types.Operator):
 
     def execute(self, context):
         rec = active_record(context)
-        name = rec.pin_a if self.index == 0 else rec.pin_b
-        pin = bpy.data.objects.get(name)
-        if pin is None:
+        pins = plan.contact_pins(rec)
+        if not (0 <= self.index < len(pins)):
             self.report({'WARNING'}, "This cut has no connector preview")
             return {'CANCELLED'}
+        pin = pins[self.index]
         for o in context.view_layer.objects:
             o.select_set(False)
         pin.hide_viewport = False
         pin.select_set(True)
         context.view_layer.objects.active = pin
         self.report({'INFO'}, "Connector selected: G move, R rotate, S scale. Reset Pin puts it back.")
+        return {'FINISHED'}
+
+
+class ESP_OT_add_connector(bpy.types.Operator):
+    bl_idname = "esp.add_connector"
+    bl_label = "Add Connector"
+    bl_description = (
+        "Click on a cut surface to place another connector there. Its size follows the room the "
+        "face has at that spot, so it never overhangs the rim"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return active_record(context) is not None and context.mode == 'OBJECT'
+
+    def invoke(self, context, event):
+        if context.area is None or context.area.type != 'VIEW_3D':
+            self.report({'ERROR'}, "Run this from the 3D Viewport")
+            return {'CANCELLED'}
+        self.rec = active_record(context)
+        self.area = context.area
+        self.window = context.window
+        self.region = window_region(self.area)
+        self.rv3d = self.region.data
+        self.mouse = (0, 0)
+        self._handle = bpy.types.SpaceView3D.draw_handler_add(self._draw_cb, (context,), 'WINDOW', 'POST_PIXEL')
+        context.window_manager.modal_handler_add(self)
+        set_cursor(self.window, CURSOR_DRAW)
+        context.workspace.status_text_set("Click on the cut surface to add a connector  |  Esc / RMB: done")
+        return {'RUNNING_MODAL'}
+
+    def _cast(self, context, coord):
+        origin = view3d_utils.region_2d_to_origin_3d(self.region, self.rv3d, coord)
+        direction = view3d_utils.region_2d_to_vector_3d(self.region, self.rv3d, coord).normalized()
+        depsgraph = context.evaluated_depsgraph_get()
+        best = None
+        for i, sobj in plan.record_surfaces(self.rec):
+            hit, loc, nor, dist = mesh_utils.object_ray_cast(sobj, origin, direction, depsgraph)
+            if hit and (best is None or dist < best[3]):
+                best = (i, loc, nor, dist)
+        return best
+
+    def modal(self, context, event):
+        self.mouse = (event.mouse_x - self.region.x, event.mouse_y - self.region.y)
+        if event.type in NAV_EVENTS:
+            return {'PASS_THROUGH'}
+        if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
+            return self.end(context)
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            found = self._cast(context, self.mouse)
+            if found is None:
+                self.report({'WARNING'}, "Click on a cut surface")
+            else:
+                i, loc, nor, _dist = found
+                _k, err = plan.place_connector_at(context, self.rec, i, loc, nor)
+                if err:
+                    self.report({'WARNING'}, err)
+                else:
+                    self.report({'INFO'}, f"Connector added on side {'AB'[i]}")
+                    plan.on_active_changed(context)
+            self.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        self.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    def _draw_cb(self, context):
+        try:
+            draw.points_2d([self.mouse], draw.ORANGE, 10.0)
+        except Exception:
+            pass
+
+    def end(self, context):
+        if getattr(self, "_handle", None) is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            self._handle = None
+        restore_cursor(getattr(self, "window", None))
+        context.workspace.status_text_set(None)
+        self.area.tag_redraw()
+        return {'FINISHED'}
+
+    def cancel(self, context):
+        self.end(context)
+
+
+class ESP_OT_remove_connector(bpy.types.Operator):
+    bl_idname = "esp.remove_connector"
+    bl_label = "Remove Connector"
+    bl_description = "Remove this extra connector from the cut"
+    bl_options = {'REGISTER', 'UNDO'}
+    index: IntProperty(default=-1)
+
+    @classmethod
+    def poll(cls, context):
+        return active_record(context) is not None
+
+    def execute(self, context):
+        rec = active_record(context)
+        if not (0 <= self.index < len(rec.connectors)):
+            return {'CANCELLED'}
+        plan.remove_connector(context, rec, self.index)
         return {'FINISHED'}
 
 
@@ -697,6 +798,8 @@ CLASSES = (
     ESP_OT_swap_pin_side,
     ESP_OT_reset_pin,
     ESP_OT_select_pin,
+    ESP_OT_add_connector,
+    ESP_OT_remove_connector,
     ESP_OT_refresh_pins,
     ESP_OT_edit_surface,
     ESP_OT_build,

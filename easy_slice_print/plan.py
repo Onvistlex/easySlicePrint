@@ -1060,7 +1060,160 @@ def record_objects(rec):
             obj = bpy.data.objects.get(name)
             if obj is not None:
                 out.append(obj)
+    for k in rec.connectors:
+        obj = bpy.data.objects.get(k.pin)
+        if obj is not None:
+            out.append(obj)
     return out
+
+
+def contact_connectors(rec, i):
+    """The extra connectors sitting on contact `i` (Side A -> 0, Side B -> 1)."""
+    letter = 'AB'[i]
+    return [k for k in rec.connectors if k.contact == letter]
+
+
+def contact_pins(rec):
+    """Every connector preview of the record, in the order the UI lists them.
+
+    The contact's own connector comes first, then its extras, contact A before B.
+    """
+    out = []
+    for i in range(contact_count(rec)):
+        pin = bpy.data.objects.get(_contact_attr(rec, "pin", i))
+        if pin is not None:
+            out.append(pin)
+        for k in contact_connectors(rec, i):
+            extra = bpy.data.objects.get(k.pin)
+            if extra is not None:
+                out.append(extra)
+    return out
+
+
+def connector_rows(rec):
+    """The record's connectors for the UI: (label, select index, extra index | None).
+
+    `select index` matches `contact_pins`; `extra index` addresses `rec.connectors`
+    (None for the connector a contact is born with, which cannot be removed).
+    """
+    rows = []
+    select = 0
+    for i in range(contact_count(rec)):
+        letter = 'AB'[i]
+        if bpy.data.objects.get(_contact_attr(rec, "pin", i)) is not None:
+            rows.append((f"Connector {letter}", select, None))
+            select += 1
+        for r_idx, k in enumerate(rec.connectors):
+            if k.contact != letter or bpy.data.objects.get(k.pin) is None:
+                continue
+            rows.append((f"Extra {letter}", select, r_idx))
+            select += 1
+    return rows
+
+
+def unique_pin_name(rec):
+    n = 1
+    while bpy.data.objects.get(f"ESP_Pin_{rec.name}_{n:02d}") is not None:
+        n += 1
+    return f"ESP_Pin_{rec.name}_{n:02d}"
+
+
+def add_connector(context, rec, i, center, normal, inscribed, matrix):
+    """Add one more connector to contact `i` and its preview pin. -> the ESP_Connector."""
+    pin = create_pin_object(context, unique_pin_name(rec), rec.shape, matrix)
+    pin.hide_viewport = not (rec.add_pin and rec.show)
+    k = rec.connectors.add()
+    k.contact = 'AB'[i]
+    k.pin = pin.name
+    k.pin_auto = flat(matrix)
+    k.center = center
+    k.normal = normal
+    k.inscribed = inscribed
+    return k
+
+
+def remove_connector(context, rec, index):
+    if not (0 <= index < len(rec.connectors)):
+        return False
+    k = rec.connectors[index]
+    obj = bpy.data.objects.get(k.pin)
+    if obj is not None:
+        mesh_utils.remove_object(obj)
+    rec.connectors.remove(index)
+    return True
+
+
+def record_surfaces(rec):
+    """(contact index, preview surface object) for every contact the cut has."""
+    out = []
+    for i in range(contact_count(rec)):
+        sobj = bpy.data.objects.get(_contact_attr(rec, "surface", i))
+        if sobj is not None:
+            out.append((i, sobj))
+    return out
+
+
+def _point_segment_distance(p, a, b):
+    ab = b - a
+    l2 = ab.length_squared
+    if l2 < 1e-12:
+        return (p - a).length
+    t = max(0.0, min(1.0, (p - a).dot(ab) / l2))
+    return (p - (a + ab * t)).length
+
+
+def patch_rim_clearance(sobj, point_w):
+    """How far a point on the cut face sits from the face's rim (its one-face edges)."""
+    verts, faces = surface_world_patch(sobj)
+    if len(verts) < 3:
+        return 0.0
+    edge_count = {}
+    for f in faces:
+        m = len(f)
+        for k in range(m):
+            key = (min(f[k], f[(k + 1) % m]), max(f[k], f[(k + 1) % m]))
+            edge_count[key] = edge_count.get(key, 0) + 1
+    p = Vector(point_w)
+    best = None
+    for (a, b), count in edge_count.items():
+        if count != 1:
+            continue
+        d = _point_segment_distance(p, Vector(verts[a]), Vector(verts[b]))
+        best = d if best is None else min(best, d)
+    return best if best is not None else 0.0
+
+
+def connector_world_radius(pin):
+    return max(pin.matrix_world.to_scale().x, 1e-6) * 0.5
+
+
+def place_connector_at(context, rec, i, center_w, normal_w):
+    """Add a connector to contact `i` at a clicked point on its cut face.
+
+    The size is capped by how much room the face has there, so a connector dropped near
+    the rim comes out small instead of overhanging. -> (ESP_Connector | None, error str).
+    """
+    sobj = bpy.data.objects.get(_contact_attr(rec, "surface", i))
+    if sobj is None:
+        return None, "This cut has no preview surface"
+    center = Vector(center_w)
+    base = Vector(_contact_attr(rec, "normal", i))
+    normal = Vector(normal_w)
+    if normal.length < 1e-9:
+        normal = base
+    if normal.dot(base) < 0.0:
+        normal = -normal
+    clearance = patch_rim_clearance(sobj, center)
+    inscribed = min(clearance * 2.0, float(_contact_attr(rec, "inscribed", i)))
+    if inscribed <= 1e-4:
+        return None, "Place the connector inside the cut face"
+    w, h = contact_size_bu(context, rec, inscribed)
+    for pin in contact_pins(rec):
+        need = (w + h) * 0.5 + connector_world_radius(pin) + max(w, h) * 0.15
+        if (pin.matrix_world.translation - center).length < need:
+            return None, "Too close to another connector"
+    matrix = connectors.connector_matrix(center, cutting.protrude_direction(normal, rec.pin_side), w, h)
+    return add_connector(context, rec, i, center, normal, inscribed, matrix), ""
 
 
 def unique_record_name(settings, prefix):
@@ -1142,6 +1295,15 @@ def on_record_settings_changed(context, rec):
             pin.matrix_world = _frame(new_auto) @ delta @ _scale(new_auto)
             _set_contact_attr(rec, "pin_auto", i, flat(new_auto))
             pin.hide_viewport = not (rec.add_pin and rec.show)
+        # extra connectors keep the spot the user put them in; only their shape and
+        # visibility follow the record's settings
+        for k in rec.connectors:
+            pin = bpy.data.objects.get(k.pin)
+            if pin is None:
+                continue
+            if pin.get("esp_shape") != rec.shape:
+                update_pin_mesh(pin, rec.shape)
+            pin.hide_viewport = not (rec.add_pin and rec.show)
     finally:
         _suspend -= 1
 
@@ -1195,6 +1357,14 @@ def reset_pins(context, rec):
             auto = auto_pin_matrix(context, rec, i)
             pin.matrix_world = auto
             _set_contact_attr(rec, "pin_auto", i, flat(auto))
+        # an extra connector has no section to re-derive from: reset means back to where
+        # it was first placed, with the stock shape
+        for k in rec.connectors:
+            pin = bpy.data.objects.get(k.pin)
+            if pin is None:
+                continue
+            update_pin_mesh(pin, rec.shape)
+            pin.matrix_world = unflat(k.pin_auto)
     finally:
         _suspend -= 1
 
@@ -1259,6 +1429,10 @@ def set_record_visibility(rec, show):
         p = bpy.data.objects.get(_contact_attr(rec, "pin", i))
         if p is not None:
             p.hide_viewport = not (show and rec.add_pin)
+    for k in rec.connectors:
+        p = bpy.data.objects.get(k.pin)
+        if p is not None:
+            p.hide_viewport = not (show and rec.add_pin)
 
 
 def on_active_changed(context):
@@ -1308,6 +1482,37 @@ def set_plan_hidden(context, hidden):
         col.hide_viewport = hidden
 
 
+def contact_connector_specs(rec, i, shape, custom):
+    """ConnectorSpec list for contact `i`: the record's own connector, then its extras."""
+    specs = []
+    pin = bpy.data.objects.get(_contact_attr(rec, "pin", i))
+    pm = pin.matrix_basis.copy() if (rec.add_pin and pin is not None) else None
+    specs.append(
+        cutting.ConnectorSpec(
+            add_pin=rec.add_pin and pm is not None,
+            pin_matrix=pm,
+            shape=shape,
+            custom_obj=custom,
+            pin_mesh=pin_unit_mesh(pin) if pm is not None else None,
+        )
+    )
+    if rec.add_pin:
+        for k in contact_connectors(rec, i):
+            kp = bpy.data.objects.get(k.pin)
+            if kp is None:
+                continue
+            specs.append(
+                cutting.ConnectorSpec(
+                    add_pin=True,
+                    pin_matrix=kp.matrix_basis.copy(),
+                    shape=shape,
+                    custom_obj=custom,
+                    pin_mesh=pin_unit_mesh(kp),
+                )
+            )
+    return specs
+
+
 def record_spec(context, rec, settings, remesh=True):
     apply_fit(context, rec)
     contacts = []
@@ -1317,17 +1522,11 @@ def record_spec(context, rec, settings, remesh=True):
         if sobj is None:
             raise cutting.CutError(f"Preview surface of '{rec.name}' is missing")
         verts, faces = cutter_world_patch(sobj)
-        pin = bpy.data.objects.get(_contact_attr(rec, "pin", i))
-        pm = pin.matrix_basis.copy() if (rec.add_pin and pin is not None) else None
         contacts.append(
             cutting.ContactSpec(
                 verts,
                 faces,
-                rec.add_pin,
-                pm,
-                shape,
-                custom,
-                pin_mesh=pin_unit_mesh(pin) if pm is not None else None,
+                connectors=contact_connector_specs(rec, i, shape, custom),
                 regions_skipped=int(sobj.get("esp_skipped", 0)),
                 preview=surface_world_patch(sobj),
             )

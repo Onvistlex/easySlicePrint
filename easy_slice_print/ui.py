@@ -9,8 +9,13 @@ from .ops_plan import active_record
 from .version import STAGE, VERSION
 
 CATEGORY = "EasySlice"
-TYPE_ICON = {'STRAIGHT': 'MESH_PLANE', 'CURVED': 'CURVE_BEZCURVE', 'FREEHAND': 'GREASEPENCIL'}
-TYPE_LABEL = {'STRAIGHT': "Plane", 'CURVED': "Curve", 'FREEHAND': "Freehand"}
+TYPE_ICON = {
+    'STRAIGHT': 'MESH_PLANE',
+    'CURVED': 'CURVE_BEZCURVE',
+    'FREEHAND': 'GREASEPENCIL',
+    'ANGLED': 'MOD_EDGESPLIT',
+}
+TYPE_LABEL = {'STRAIGHT': "Plane", 'CURVED': "Curve", 'FREEHAND': "Freehand", 'ANGLED': "Angled"}
 
 
 class ESP_UL_cuts(bpy.types.UIList):
@@ -255,12 +260,17 @@ class ESP_PT_plan(ESPPanel, bpy.types.Panel):
                 box.label(text="G move, R rotate, S scale the plane", icon='INFO')
             else:
                 box.label(text="Drag points; G slides the whole cut", icon='INFO')
+            box.label(text="Connectors", icon='LINKED')
+            for label, sel, rem in plan.connector_rows(rec):
+                row = box.row(align=True)
+                row.operator("esp.select_pin", text=label, icon='RESTRICT_SELECT_OFF').index = sel
+                if rem is not None:
+                    op = row.operator("esp.remove_connector", text="", icon='X')
+                    op.index = rem
             row = box.row(align=True)
-            row.operator("esp.select_pin", text="Select Connector", icon='RESTRICT_SELECT_OFF').index = 0
-            if rec.two_contact:
-                row.operator("esp.select_pin", text="2nd", icon='RESTRICT_SELECT_OFF').index = 1
-            row.operator("esp.reset_pin", text="Reset", icon='LOOP_BACK')
-            box.label(text="Tab into the connector to reshape it; Build follows it", icon='INFO')
+            row.operator("esp.add_connector", text="Add Connector", icon='ADD')
+            row.operator("esp.reset_pin", text="Reset All", icon='LOOP_BACK')
+            box.label(text="Tab into a connector to reshape it; Build follows it", icon='INFO')
         if s.built:
             row = layout.row(align=True)
             row.scale_y = 1.2
@@ -284,14 +294,12 @@ class ESP_PT_pin_adjust(ESPPanel, bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         rec = active_record(context)
-        names = [rec.pin_a] + ([rec.pin_b] if rec.two_contact else [])
-        for i, name in enumerate(names):
-            pin = bpy.data.objects.get(name)
-            if pin is None:
-                layout.label(text="No connector preview", icon='ERROR')
-                continue
-            if len(names) > 1:
-                layout.label(text=f"Contact {i + 1}")
+        pins = plan.contact_pins(rec)
+        if not pins:
+            layout.label(text="No connector preview", icon='ERROR')
+        for i, pin in enumerate(pins):
+            if len(pins) > 1:
+                layout.label(text=f"Connector {i + 1}")
             col = layout.column(align=True)
             col.prop(pin, "location")
             col.prop(pin, "rotation_euler", text="Rotation")

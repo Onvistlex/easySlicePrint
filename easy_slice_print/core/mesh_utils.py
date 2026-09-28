@@ -146,6 +146,25 @@ def boolean_mesh(context, base_mesh, cutter_mesh, operation, solver='AUTO'):
     return result
 
 
+def mesh_copy(mesh, name):
+    out = mesh.copy()
+    out.name = name
+    return out
+
+
+def mesh_intersects(context, base_mesh, cutter_mesh, solver='AUTO'):
+    """True when the two solids actually share volume (their intersection is not empty).
+
+    Used to keep a connector that landed in air from being built: a union would add a
+    floating pin and a difference comes back empty, and `boolean_mesh` reports that by
+    returning nothing - which, handed on as the part, would wipe it.
+    """
+    me = boolean_mesh(context, base_mesh, cutter_mesh, 'INTERSECT', solver)
+    hit = len(me.polygons) > 0
+    remove_mesh(me)
+    return hit
+
+
 # ----------------------------------------------------------------------------
 # loose parts / join
 # ----------------------------------------------------------------------------

@@ -199,6 +199,26 @@ def connector_props(update=None):
     }
 
 
+class ESP_Connector(bpy.types.PropertyGroup):
+    """An extra connector on a cut surface, beyond the one the cut is born with.
+
+    The first connector of each contact keeps living in the record's own fields
+    (`pin_a`/`center_a`/...); this is for the second, third and so on, so one seam can
+    carry several pins.
+    """
+
+    contact: EnumProperty(
+        name="Side",
+        items=[('A', "Side A", "Connector on cut surface A"), ('B', "Side B", "Connector on cut surface B")],
+        default='A',
+    )
+    pin: StringProperty(description="Connector preview object")
+    pin_auto: FloatVectorProperty(size=16, default=(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1))
+    center: FloatVectorProperty(size=3)
+    normal: FloatVectorProperty(size=3, default=(0, 0, 1))
+    inscribed: FloatProperty(default=1.0)
+
+
 class ESP_CutRecord(bpy.types.PropertyGroup):
     name: StringProperty(name="Name", default="Cut")
     cut_type: EnumProperty(name="Type", items=TOOL_ITEMS, default='STRAIGHT')
@@ -223,6 +243,9 @@ class ESP_CutRecord(bpy.types.PropertyGroup):
     anchor: FloatVectorProperty(
         size=3, description="World point on the model used to pick the part this cut applies to"
     )
+    # Extra connectors on top of the one each contact is born with (the record's own
+    # `pin_a`/`pin_b`); see ESP_Connector.
+    connectors: CollectionProperty(type=ESP_Connector)
     built: BoolProperty(default=False)
 
 
@@ -370,7 +393,7 @@ class ESP_Settings(bpy.types.PropertyGroup):
 ESP_Settings.__annotations__.update(connector_props(update=_settings_update))
 
 
-CLASSES = (ESP_CutRecord, ESP_Settings)
+CLASSES = (ESP_Connector, ESP_CutRecord, ESP_Settings)
 
 
 def register():

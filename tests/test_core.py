@@ -4,6 +4,7 @@
 
 import math
 import os
+import re
 import sys
 import time
 
@@ -115,6 +116,81 @@ def test_straight_cut_with_pin():
     check(vb < lower_plain - pin_vol * 0.8, f"socket removed material from B ({lower_plain - vb:.0f} mm3)")
     check(cutting.side_labels(ca, cb) == ("UPPER", "LOWER"), "side labels")
     return obj
+
+
+def _connector_cut(x_positions, with_air=False):
+    """Cut a cylinder at z=0 with one connector per x, optionally plus one parked in air.
+
+    -> (obj, part_a, part_b) volumes as the parts' own mesh volumes.
+    """
+    reset_scene()
+    obj = make_cylinder()
+    diag = mesh_utils.object_world_diagonal(obj)
+    verts, faces = surfaces.plane_patch(Vector((0, 0, 0.0)), Vector((0, 0, 1)), Vector((1, 0, 0)), diag * 1.3)
+    width = 6.0
+    normal = Vector((0, 0, 1))
+    specs = []
+    for cx in x_positions:
+        center = Vector((cx, 0.0, 0.0))
+        pm = connectors.connector_matrix(center, cutting.protrude_direction(normal, 'A'), width, width * 1.2)
+        specs.append(cutting.ConnectorSpec(True, pm, 'CYLINDER', None))
+    if with_air:
+        air = connectors.connector_matrix(Vector((500.0, 500.0, 500.0)), Vector((0, 0, 1)), width, width * 1.2)
+        specs.append(cutting.ConnectorSpec(True, air, 'CYLINDER', None))
+    spec = cutting.CutSpec(
+        contacts=[cutting.ContactSpec(verts, faces, connectors=specs)],
+        gap=0.2,
+        clearance=0.15,
+        tip_extra=0.2,
+        pin_side='A',
+    )
+    a, b, _secs = cutting.perform_cut(bpy.context, obj, spec, ("UP", "DOWN"), out_collection("out"))
+    mn_a, mx_a = mesh_utils.mesh_bounds(a.data)
+    return obj, {
+        "a_manifold": is_closed_manifold(a.data),
+        "b_manifold": is_closed_manifold(b.data),
+        "va": mesh_utils.mesh_volume(a.data),
+        "vb": mesh_utils.mesh_volume(b.data),
+        "a_xy_max": max(abs(mn_a.x), abs(mx_a.x), abs(mn_a.y), abs(mx_a.y)),
+    }
+
+
+def test_icons_are_valid():
+    print("== every icon named in the add-on exists in this Blender")
+    root = os.path.join(ROOT, "easy_slice_print")
+    enum = bpy.types.UILayout.bl_rna.functions["label"].parameters["icon"]
+    valid = {item.identifier for item in enum.enum_items}
+    bad = []
+    for dirpath, _dirs, files in os.walk(root):
+        for fname in files:
+            if not fname.endswith(".py"):
+                continue
+            with open(os.path.join(dirpath, fname), encoding="utf-8") as fh:
+                for n, line in enumerate(fh, 1):
+                    for match in re.finditer(r"icon='([A-Z0-9_]+)'", line):
+                        if match.group(1) not in valid:
+                            bad.append(f"{fname}:{n}: {match.group(1)}")
+    # a bad icon name raises while the panel draws, taking every widget after it down
+    # with it, which looks like "the button is missing" rather than an error
+    check(not bad, "no unknown icon names" + (f" ({bad})" if bad else ""))
+
+
+def test_multiple_connectors_on_one_cut():
+    print("== several connectors on one cut, and one parked in air")
+    plain = math.pi * 10.0**2 * 30.0
+    _o1, one = _connector_cut([0.0])
+    _o2, two = _connector_cut([-5.0, 5.0])
+    _o3, air = _connector_cut([-5.0, 5.0], with_air=True)
+    for label, r in (("one", one), ("two", two), ("two+air", air)):
+        check(r["a_manifold"] and r["b_manifold"], f"both parts closed manifold ({label} connector)")
+    add_one, add_two = one["va"] - plain, two["va"] - plain
+    sock_one, sock_two = plain - one["vb"], plain - two["vb"]
+    check(add_two > add_one * 1.6, f"a second pin adds material to A ({add_one:.0f} -> {add_two:.0f})")
+    check(sock_two > sock_one * 1.6, f"a second socket carves B ({sock_one:.0f} -> {sock_two:.0f})")
+    # the connector in air is skipped: it changes nothing and leaves nothing behind
+    check(abs(air["va"] - two["va"]) < plain * 0.01, "the air connector did not touch A")
+    check(air["a_xy_max"] < 12.0, "no floating pin off the model")
+    return _o2
 
 
 def test_angled_cut():
@@ -1277,6 +1353,8 @@ def test_ribbon_follows_a_silhouette():
 if __name__ == "__main__":
     t = time.time()
     test_straight_cut_with_pin()
+    test_icons_are_valid()
+    test_multiple_connectors_on_one_cut()
     test_angled_cut()
     test_ribbon_cut()
     test_loop_cut()

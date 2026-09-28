@@ -248,6 +248,42 @@ def test_build_shows_why_a_cut_failed():
     s.diagnose_failed = True
 
 
+def test_multiple_connectors():
+    print("== a cut can carry more than one connector")
+    sc = reset_scene()
+    obj = make_cylinder()
+    s = sc.esp
+    s.mode = 'PLAN'
+    diag = mesh_utils.object_world_diagonal(obj)
+    ctx = bpy.context
+    rec = plan.add_record(ctx, obj, 'STRAIGHT', [plane_contact(5.0, diag)])
+    rec.size_preset = 'CUSTOM'
+    rec.pin_width_mm = 3.0
+    rec.pin_height_mm = 3.0
+    check(len(plan.contact_pins(rec)) == 1, "the cut is born with one connector")
+
+    k, err = plan.place_connector_at(ctx, rec, 0, Vector((6.0, 0.0, 5.0)), Vector(rec.normal_a))
+    check(k is not None, f"a second connector is placed ({err})")
+    check(len(rec.connectors) == 1 and len(plan.contact_pins(rec)) == 2, "the record now lists two connectors")
+    rows = plan.connector_rows(rec)
+    check(len(rows) == 2 and rows[1][2] == 0, "the extra one is the removable row")
+    k2, err2 = plan.place_connector_at(ctx, rec, 0, Vector((-6.0, 0.0, 5.0)), Vector(rec.normal_a))
+    check(k2 is not None, f"a third, on the other side, is fine ({err2})")
+
+    bpy.ops.esp.build()
+    check(s.built, "the multi-connector cut builds")
+    col = bpy.data.collections.get(s.built_collection)
+    parts = list(col.objects)
+    check(len(parts) == 2, f"two parts ({len(parts)})")
+    closed = all(
+        mesh_utils.manifold_report(o.data)[0] == 0 and mesh_utils.manifold_report(o.data)[1] == 0 for o in parts
+    )
+    check(closed, "both parts closed manifold")
+    bpy.ops.esp.return_to_plan()
+    plan.remove_connector(ctx, rec, 0)
+    check(len(rec.connectors) == 1 and len(plan.contact_pins(rec)) == 2, "one extra connector removed")
+
+
 def test_plane_section_preview():
     """A plane cut's preview is the model's cross section, and it follows the plane."""
     print("== plane cut surface tracks the model's cross section")
@@ -848,6 +884,7 @@ if __name__ == "__main__":
     test_cut_after_approve()
     test_approve_keeps_unbuilt_cuts()
     test_two_contact_surfaces_edit_by_points()
+    test_multiple_connectors()
     test_quick_mode()
     test_quick_plane_section()
     test_printer_fit()
