@@ -405,6 +405,29 @@ class ESP_OT_align_subplanes(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class ESP_OT_toggle_cut_trim(bpy.types.Operator):
+    bl_idname = "esp.toggle_cut_trim"
+    bl_label = "Trim to Line"
+    bl_description = (
+        "Toggle how far an Angled cut reaches: trimmed to the drawn line (its length and the "
+        "wall under it), or the whole plane across the model. Trimmed keeps the cut on the "
+        "line but may not separate a shell unless the line runs round the whole silhouette"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        rec = active_record(context)
+        return rec is not None and rec.cut_type == 'ANGLED' and context.mode == 'OBJECT'
+
+    def execute(self, context):
+        rec = active_record(context)
+        value = not plan.cut_is_trimmed(rec)
+        plan.set_cut_trim(context, rec, value)
+        self.report({'INFO'}, "Cut trimmed to the line" if value else "Cutting the whole plane")
+        return {'FINISHED'}
+
+
 class ESP_OT_remove_connector(bpy.types.Operator):
     bl_idname = "esp.remove_connector"
     bl_label = "Remove Connector"
@@ -1088,6 +1111,7 @@ CLASSES = (
     ESP_OT_remove_connector,
     ESP_OT_rotate_subplane,
     ESP_OT_align_subplanes,
+    ESP_OT_toggle_cut_trim,
     ESP_OT_refresh_pins,
     ESP_OT_edit_surface,
     ESP_OT_build,

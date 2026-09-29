@@ -5,6 +5,7 @@ core cut pipeline."""
 
 import math
 
+import bmesh
 import bpy
 from bpy.app.handlers import persistent
 from mathutils import Matrix, Vector
@@ -332,8 +333,52 @@ def _pick_align_normal(a, b, samples, symmetry=None):
     return best[2].normalized() if best and best[2].length > 1e-9 else None
 
 
+def _clip_patch_rect(verts, faces, origin, u, v, u0, u1, v0=None, v1=None):
+    """Clip a world-space patch to the rectangle [u0,u1] x [v0,v1] about `origin`.
+
+    A plane section is the model's whole cross-section, which reaches well past the drawn
+    line; the cut face only belongs on the line, so it is trimmed to the line's length and
+    (when it was measured) the wall's depth. -> (verts, faces) or None if nothing is left.
+    """
+    bm = bmesh.new()
+    bverts = [bm.verts.new(Vector(p)) for p in verts]
+    for f in faces:
+        try:
+            bm.faces.new([bverts[i] for i in f])
+        except ValueError:
+            pass
+    bm.normal_update()
+    u = Vector(u).normalized()
+    v = v.normalized() if v is not None else None
+    planes = [(Vector(origin) + u * u0, u), (Vector(origin) + u * u1, -u)]
+    if v0 is not None and v1 is not None and v is not None:
+        planes.append((Vector(origin) + v * v0, v))
+        planes.append((Vector(origin) + v * v1, -v))
+    for co, no in planes:
+        geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+        if not geom:
+            break
+        bmesh.ops.bisect_plane(
+            bm, geom=geom, dist=1e-6, plane_co=co, plane_no=no, clear_inner=True, clear_outer=False
+        )
+    bm.verts.index_update()
+    out_v = [vert.co.copy() for vert in bm.verts]
+    out_f = [tuple(vert.index for vert in f.verts) for f in bm.faces]
+    bm.free()
+    return (out_v, out_f) if out_f else None
+
+
 def angled_surface(
-    context, target, points, view_dir, reference=None, tilts=None, align=None, align_faces=None, sym_axis=None
+    context,
+    target,
+    points,
+    view_dir,
+    reference=None,
+    tilts=None,
+    align=None,
+    align_faces=None,
+    sym_axis=None,
+    trim_line=True,
 ):
     """One cut surface made of linked plane segments (hard edges, no rounding).
 
@@ -452,24 +497,106 @@ def angled_surface(
             elif r.dot(ref) < 0.0:
                 r = -r
         rails.append(r.normalized() if r.length > 1e-9 else d.copy())
-    cv = []
-    ni = []
-    fi = []
-    for i, p in enumerate(pts):
-        ni.append(len(cv))
-        cv.append(p - rails[i] * reach)
-        fi.append(len(cv))
-        cv.append(p + rails[i] * reach)
-    cf = []
+    # measure the run of material under each segment (the wall): rays along the segment's
+    # own reach direction, at a few points, unioned - so a drawn end sitting in air still
+    # gets its segment's wall, and a plane that would cross the model elsewhere has
+    # nothing to cut there
+    pad = diag * 0.01
+    depsgraph = context.evaluated_depsgraph_get() if context is not None else None
+    seg_r = []
+    seg_band = []  # the kerf cutter needs the wall widened into the air beside it
+    seg_wall = []  # the visible face is the bare wall
     for i in range(len(pts) - 1):
-        if normals[i] is None:
-            continue
-        face = (ni[i], ni[i + 1], fi[i + 1], fi[i])
-        if (cv[ni[i + 1]] - cv[ni[i]]).cross(cv[fi[i + 1]] - cv[ni[i]]).dot(normals[i]) < 0.0:
-            face = tuple(reversed(face))  # keep the cutter's own normal on side A
-        cf.append(face)
+        r = normals[i].cross(axes[i]) if normals[i] is not None else None
+        r = r.normalized() if (r is not None and r.length > 1e-9) else None
+        band = wall = None
+        if r is not None and depsgraph is not None:
+            a, b = pts[i], pts[i + 1]
+            for f in (0.2, 0.5, 0.8):
+                s = a + (b - a) * f
+                hits = mesh_utils.object_ray_hits(target, s - r * diag, r, diag * 1e-4, depsgraph, max_dist=diag * 3.0)
+                runs = [(hits[k] - diag, hits[k + 1] - diag) for k in range(0, len(hits) - 1, 2)]
+                if not runs:
+                    continue
+                head = next((run for run in runs if run[0] <= 0.0 <= run[1]), None)
+                if head is None:
+                    head = min(runs, key=lambda run: min(abs(run[0]), abs(run[1])))
+                wall = head if wall is None else (min(wall[0], head[0]), max(wall[1], head[1]))
+                wide = (head[0] - pad, head[1] + pad)
+                band = wide if band is None else (min(band[0], wide[0]), max(band[1], wide[1]))
+        seg_r.append(r)
+        seg_band.append(band)
+        seg_wall.append(wall)
+    on_surface = depsgraph is not None
+    if on_surface:
+        for p in pts:
+            found, _loc, _nor, depth = mesh_utils.object_surface_depth(target, p, depsgraph)
+            # a point drawn just off the surface is fine; one buried in the model or well
+            # clear of it means the line is not a surface line, and the wall is unknown
+            if not found or depth < -diag * 0.01 or depth > diag * 0.1:
+                on_surface = False
+                break
+    measured = [i for i, band in enumerate(seg_band) if band is not None]
+    if measured:
+        # a segment whose own wall the rays cannot see (a leaning plane, a short segment)
+        # borrows the nearest measured wall, so the whole cut stays bounded and joined
+        for i in range(len(seg_band)):
+            if seg_band[i] is None:
+                j = min(measured, key=lambda k: abs(k - i))
+                seg_band[i] = seg_band[j]
+                seg_wall[i] = seg_wall[j]
+    bounded = trim_line and on_surface and bool(measured)
 
-    # the visible cut face: the model's own cross section on each segment's plane
+    cv = []
+    cf = []
+    if bounded:
+        # one flat, bounded quad per segment (the line's length across it, the wall's depth
+        # into it): it stops at the wall, so the plane does not reach across the model. The
+        # joints between neighbouring quads are bridged, so the wall stays one continuous
+        # sheet - without the bridge there is a wedge of a gap at each bend and the parts
+        # come back joined.
+        bases = []
+        for i in range(len(pts) - 1):
+            if normals[i] is None:
+                bases.append(None)
+                continue
+            a, b = pts[i], pts[i + 1]
+            axis = axes[i]
+            r = seg_r[i]
+            lo, hi = seg_band[i]
+            a2, b2 = a - axis * trim, b + axis * trim
+            base = len(cv)
+            cv.extend((a2 + r * lo, a2 + r * hi, b2 + r * lo, b2 + r * hi))
+            face = (base, base + 2, base + 3, base + 1)
+            if (cv[base + 2] - cv[base]).cross(cv[base + 3] - cv[base]).dot(normals[i]) < 0.0:
+                face = tuple(reversed(face))
+            cf.append(face)
+            bases.append(base)
+        for i in range(len(bases) - 1):
+            b0, b1 = bases[i], bases[i + 1]
+            if b0 is None or b1 is None:
+                continue
+            cf.append((b0 + 2, b1 + 0, b1 + 1, b0 + 3))  # bridge the two joint edges
+    else:
+        # not a surface line everywhere: keep the plain, full-length strip (shared rails,
+        # so it is one continuous sheet straight through the model)
+        ni = []
+        fi = []
+        for i, p in enumerate(pts):
+            ni.append(len(cv))
+            cv.append(p - rails[i] * reach)
+            fi.append(len(cv))
+            cv.append(p + rails[i] * reach)
+        for i in range(len(pts) - 1):
+            if normals[i] is None:
+                continue
+            face = (ni[i], ni[i + 1], fi[i + 1], fi[i])
+            if (cv[ni[i + 1]] - cv[ni[i]]).cross(cv[fi[i + 1]] - cv[ni[i]]).dot(normals[i]) < 0.0:
+                face = tuple(reversed(face))
+            cf.append(face)
+
+    # the visible cut face: the model's cross section on each segment, trimmed to the
+    # line's length, and to the wall's depth when it was measured
     pv, pf = [], []
     skipped = 0
     for i in range(len(pts) - 1):
@@ -480,13 +607,31 @@ def angled_surface(
         a, b = pts[i], pts[i + 1]
         c = (a + b) * 0.5
         half = (b - a).length * 0.5
-        patch = straight_section(context, target, c, n, (axis, -half, half),
-                                 reference if reference is not None else c)
+        patch = straight_section(context, target, c, n, (axis, -half, half), reference if reference is not None else c)
         if patch is None:
             continue
+        if trim_line:
+            v0, v1 = seg_wall[i] if seg_wall[i] is not None else (None, None)
+            clipped = _clip_patch_rect(
+                [Vector(x) for x in patch[0]],
+                [tuple(f) for f in patch[1]],
+                c,
+                axis,
+                seg_r[i],
+                -half,
+                half,
+                v0,
+                v1,
+            )
+            if clipped is None:
+                continue
+            sv, sf = clipped
+        else:
+            sv = [Vector(x) for x in patch[0]]
+            sf = [tuple(f) for f in patch[1]]
         base = len(pv)
-        pv.extend(Vector(v) for v in patch[0])
-        pf.extend(tuple(base + idx for idx in f) for f in patch[1])
+        pv.extend(sv)
+        pf.extend(tuple(base + idx for idx in f) for f in sf)
         skipped += int(patch.islands - patch.kept)
     if not cf or not pf:
         return None
@@ -794,6 +939,22 @@ def set_segment_align(context, rec, index, value):
         if partner is not None and partner != index:
             align[partner] = bool(value)
     sobj["esp_align"] = align
+    _rebuild_keep_pins(context, rec, sobj, target)
+    return True
+
+
+def cut_is_trimmed(rec):
+    sobj = bpy.data.objects.get(rec.surface_a)
+    return bool(sobj.get("esp_trim", True)) if sobj is not None else True
+
+
+def set_cut_trim(context, rec, value):
+    """Trim the angled cut to the drawn line (True) or cut the whole plane (False)."""
+    sobj = bpy.data.objects.get(rec.surface_a)
+    target = record_target(rec)
+    if sobj is None or target is None:
+        return False
+    sobj["esp_trim"] = bool(value)
     _rebuild_keep_pins(context, rec, sobj, target)
     return True
 
@@ -1138,6 +1299,7 @@ def rebuild_surface(obj, draft=False, context=None, target=None):
             align=align,
             align_faces=align_faces,
             sym_axis=obj.get("esp_sym_axis"),
+            trim_line=bool(obj.get("esp_trim", True)),
         )
         if built is None:
             return
@@ -1641,11 +1803,9 @@ def on_record_settings_changed(context, rec):
                 continue
             if pin.get("esp_shape") != rec.shape:
                 update_pin_mesh(pin, rec.shape)
-            old_auto = unflat(_contact_attr(rec, "pin_auto", i))
-            new_auto = auto_pin_matrix(context, rec, i)
-            delta = user_delta(old_auto, pin.matrix_basis)
-            pin.matrix_world = _frame(new_auto) @ delta @ _scale(new_auto)
-            _set_contact_attr(rec, "pin_auto", i, flat(new_auto))
+            # a connector is not moved or rescaled automatically: it stays where it was put
+            # (its size is set once when the cut is made, or by Reset Connector). Editing the
+            # cut plane no longer drags it around
             pin.hide_viewport = not (rec.add_pin and rec.show)
         # extra connectors keep the spot the user put them in; only their shape and
         # visibility follow the record's settings

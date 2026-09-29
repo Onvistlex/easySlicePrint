@@ -275,6 +275,11 @@ class ESP_PT_plan(ESPPanel, bpy.types.Panel):
                 row.operator("esp.rotate_subplane", text="Rotate Sub-planes", icon='FILE_REFRESH')
                 row.operator("esp.align_subplanes", text="Main Normal", icon='CONSTRAINT')
                 row = box.row(align=True)
+                row.operator(
+                    "esp.toggle_cut_trim", text="Trim to Line", icon='TRIA_DOWN_BAR',
+                    depress=plan.cut_is_trimmed(rec),
+                )
+                row = box.row(align=True)
                 row.prop(rec, "symmetric", toggle=True, icon='MOD_MIRROR')
                 if rec.symmetric:
                     row.prop(rec, "symmetry_axis", text="")

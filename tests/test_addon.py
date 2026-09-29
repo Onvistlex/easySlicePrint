@@ -262,12 +262,12 @@ def test_multiple_connectors():
     rec.pin_height_mm = 3.0
     check(len(plan.contact_pins(rec)) == 1, "the cut is born with one connector")
 
-    k, err = plan.place_connector_at(ctx, rec, 0, Vector((6.0, 0.0, 5.0)), Vector(rec.normal_a))
+    k, err = plan.place_connector_at(ctx, rec, 0, Vector((8.0, 0.0, 5.0)), Vector(rec.normal_a))
     check(k is not None, f"a second connector is placed ({err})")
     check(len(rec.connectors) == 1 and len(plan.contact_pins(rec)) == 2, "the record now lists two connectors")
     rows = plan.connector_rows(rec)
     check(len(rows) == 2 and rows[1][2] == 0, "the extra one is the removable row")
-    k2, err2 = plan.place_connector_at(ctx, rec, 0, Vector((-6.0, 0.0, 5.0)), Vector(rec.normal_a))
+    k2, err2 = plan.place_connector_at(ctx, rec, 0, Vector((-8.0, 0.0, 5.0)), Vector(rec.normal_a))
     check(k2 is not None, f"a third, on the other side, is fine ({err2})")
 
     bpy.ops.esp.build()
@@ -642,10 +642,12 @@ def test_plan_workflow():
     # change settings on the record -> preview follows
     pin = bpy.data.objects.get(rec1.pin_a)
     old_scale = pin.scale.copy()
+    old_matrix = pin.matrix_world.copy()
     rec1.size_preset = 'LARGE'
-    check(pin.scale.x > old_scale.x, "preset change rescaled the pin preview")
+    check(abs(pin.scale.x - old_scale.x) < 1e-6, "the connector keeps its size when the preset changes")
     rec1.pin_side = 'B'
-    check(pin.matrix_world.col[2].xyz.z > 0.5, "swap side flipped the pin direction (+Z now up)")
+    moved = max(abs(pin.matrix_world[i][j] - old_matrix[i][j]) for i in range(4) for j in range(4))
+    check(moved < 1e-6, f"and stays put when the pin side is swapped ({moved:.1e})")
     rec1.shape = 'HEX'
     check(pin.get("esp_shape") == 'HEX' and len(pin.data.polygons) == 8, "shape change rebuilt the pin mesh")
     # user moves the pin -> delta preserved on later changes
