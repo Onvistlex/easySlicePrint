@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Rafael Omodei and EasySlice Print contributors
 """Plan mode operators: manage records, edit surfaces, build/approve."""
 
+import math
 import time
 
 import bpy
@@ -208,6 +209,202 @@ class ESP_OT_add_connector(bpy.types.Operator):
         self.end(context)
 
 
+class ESP_OT_rotate_subplane(bpy.types.Operator):
+    bl_idname = "esp.rotate_subplane"
+    bl_label = "Rotate Sub-planes"
+    bl_description = (
+        "Hover a segment of an Angled cut and drag sideways to lean that one plane about its "
+        "own drawn line. S toggles symmetry (the far side leans the other way), C clears, "
+        "Esc / RMB finishes"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        rec = active_record(context)
+        return rec is not None and rec.cut_type == 'ANGLED' and context.mode == 'OBJECT'
+
+    def invoke(self, context, event):
+        if context.area is None or context.area.type != 'VIEW_3D':
+            self.report({'ERROR'}, "Run this from the 3D Viewport")
+            return {'CANCELLED'}
+        self.rec = active_record(context)
+        self.area = context.area
+        self.window = context.window
+        self.region = window_region(self.area)
+        self.rv3d = self.region.data
+        self.mouse = (0, 0)
+        self.hover = None
+        self.drag_index = None
+        self.drag_start = None
+        self._handle = bpy.types.SpaceView3D.draw_handler_add(self._draw_cb, (context,), 'WINDOW', 'POST_PIXEL')
+        context.window_manager.modal_handler_add(self)
+        set_cursor(self.window, CURSOR_DRAW)
+        self._status(context)
+        return {'RUNNING_MODAL'}
+
+    # -- geometry ------------------------------------------------------------
+    def _segments(self):
+        sobj = bpy.data.objects.get(self.rec.surface_a)
+        if sobj is None:
+            return []
+        pts = [sobj.matrix_basis @ p for p in plan.surface_points(sobj)]
+        return [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+
+    def _tilts(self):
+        sobj = bpy.data.objects.get(self.rec.surface_a)
+        return list(sobj.get("esp_tilt", [])) if sobj is not None else []
+
+    def _nearest(self, coord):
+        best, best_d = None, 16.0
+        for i, (a, b) in enumerate(self._segments()):
+            pa, pb = self.to2d(a), self.to2d(b)
+            if pa is None or pb is None:
+                continue
+            mid = ((pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5)
+            d = dist2d(mid, coord)
+            if d < best_d:
+                best, best_d = i, d
+        return best
+
+    def to2d(self, world):
+        return view3d_utils.location_3d_to_region_2d(self.region, self.rv3d, world)
+
+    def _status(self, context):
+        context.workspace.status_text_set(
+            "Hover a segment, drag sideways to lean it  |  A: cut along main normal  |  "
+            "S: symmetry  |  C: clear  |  Esc / RMB: done"
+        )
+        try:
+            mode = "symmetric" if self.rec.symmetric else "free"
+            context.area.header_text_set(f"EasySlice: Sub-planes ({mode})")
+        except Exception:
+            pass
+
+    def _align(self):
+        sobj = bpy.data.objects.get(self.rec.surface_a)
+        return list(sobj.get("esp_align", [])) if sobj is not None else []
+
+    # -- modal ---------------------------------------------------------------
+    def modal(self, context, event):
+        self.mouse = (event.mouse_x - self.region.x, event.mouse_y - self.region.y)
+        if event.type in NAV_EVENTS:
+            return {'PASS_THROUGH'}
+        if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
+            return self.end(context)
+        if event.type == 'MOUSEMOVE':
+            if self.drag_index is None:
+                self.hover = self._nearest(self.mouse)
+            else:
+                dx = self.mouse[0] - self.drag_start[0]
+                angle = self.drag_start[1] + dx * math.radians(0.5)  # half a degree per pixel
+                plan.set_segment_tilt(context, self.rec, self.drag_index, angle)
+            self.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            i = self._nearest(self.mouse)
+            if i is not None:
+                tilts = self._tilts()
+                self.drag_index = i
+                self.drag_start = (self.mouse[0], tilts[i] if i < len(tilts) else 0.0)
+            return {'RUNNING_MODAL'}
+        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            self.drag_index = None
+            return {'RUNNING_MODAL'}
+        if event.type == 'A' and event.value == 'PRESS':
+            if self.hover is not None:
+                align = self._align()
+                value = not (align[self.hover] if self.hover < len(align) else False)
+                plan.set_segment_align(context, self.rec, self.hover, value)
+            return {'RUNNING_MODAL'}
+        if event.type == 'S' and event.value == 'PRESS':
+            self.rec.symmetric = not self.rec.symmetric
+            self._status(context)
+            return {'RUNNING_MODAL'}
+        if event.type == 'C' and event.value == 'PRESS':
+            sobj = bpy.data.objects.get(self.rec.surface_a)
+            target = plan.record_target(self.rec)
+            if sobj is not None and target is not None:
+                sobj["esp_tilt"] = []
+                plan.rebuild_surface(sobj, context=context, target=target)
+                plan.refresh_record_frames(context, self.rec)
+            return {'RUNNING_MODAL'}
+        return {'RUNNING_MODAL'}
+
+    def _draw_cb(self, context):
+        try:
+            if bpy.context.region is None or bpy.context.region.as_pointer() != self.region.as_pointer():
+                return
+            align = self._align()
+            for i, (a, b) in enumerate(self._segments()):
+                pa, pb = self.to2d(a), self.to2d(b)
+                if pa is None or pb is None:
+                    continue
+                active = i == self.hover or i == self.drag_index
+                aligned = i < len(align) and align[i]
+                if active:
+                    color = draw.WHITE
+                elif aligned:
+                    color = draw.GREEN  # cut along the main normal
+                else:
+                    color = draw.ORANGE
+                draw.lines_2d([pa, pb], color, 3.5 if active else 2.0)
+        except Exception:
+            pass
+
+    def end(self, context):
+        if getattr(self, "_handle", None) is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            self._handle = None
+        restore_cursor(getattr(self, "window", None))
+        context.workspace.status_text_set(None)
+        try:
+            self.area.header_text_set(None)
+        except Exception:
+            pass
+        self.area.tag_redraw()
+        return {'FINISHED'}
+
+    def cancel(self, context):
+        self.end(context)
+
+
+class ESP_OT_align_subplanes(bpy.types.Operator):
+    bl_idname = "esp.align_subplanes"
+    bl_label = "Main Normal"
+    bl_description = (
+        "Toggle: lay every sub-plane of this angled cut along the main normal of the surface "
+        "under it (per side, so two sides come out mirrored), instead of along the view"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        rec = active_record(context)
+        return rec is not None and rec.cut_type == 'ANGLED' and context.mode in {'OBJECT', 'EDIT_MESH'}
+
+    def execute(self, context):
+        rec = active_record(context)
+        target = plan.record_target(rec)
+        if target is None:
+            return {'CANCELLED'}
+        samples = plan.face_selection_samples(target)
+        if samples:
+            # Edit mode with a selection: that flat area is the main normal
+            plan.set_align_from_selection(context, rec, samples)
+            self.report({'INFO'}, f"Sub-planes cut along the normal of {len(samples)} selected face(s)")
+            return {'FINISHED'}
+        if context.mode != 'OBJECT':
+            self.report({'WARNING'}, "Select the faces that define the main normal, or run this in Object mode")
+            return {'CANCELLED'}
+        value = not plan.segments_all_aligned(rec)
+        plan.set_all_align(context, rec, value)
+        if not value:
+            plan.clear_align_faces(rec)
+        self.report({'INFO'}, "Sub-planes cut along the main normal" if value else "Sub-planes cut by the view")
+        return {'FINISHED'}
+
+
 class ESP_OT_remove_connector(bpy.types.Operator):
     bl_idname = "esp.remove_connector"
     bl_label = "Remove Connector"
@@ -307,13 +504,90 @@ class ESP_OT_edit_surface(bpy.types.Operator):
         self.slide = None
         self.mouse = (0, 0)
         self.changed = False
+        self.sym = bool(rec.symmetric)  # the record's Symmetric switch drives mirror editing
+        self.sym_axis = rec.symmetry_axis
+        self.diag = mesh_utils.object_world_diagonal(self.target) if self.target is not None else 1.0
         self._handle = bpy.types.SpaceView3D.draw_handler_add(self._draw_cb, (context,), 'WINDOW', 'POST_PIXEL')
         context.window_manager.modal_handler_add(self)
         set_cursor(self.window, CURSOR_DRAW)
-        context.workspace.status_text_set(
-            "Drag point: LMB | Add: Ctrl+LMB | Delete: X | Slide all: G | Reset: R | Undo: Ctrl+Z | Finish: Enter / Esc"
-        )
+        self._status(context)
         return {'RUNNING_MODAL'}
+
+    def _status(self, context):
+        state = "symmetric" if self.sym else "free"
+        context.workspace.status_text_set(
+            f"Drag: LMB | Add: Ctrl+LMB | Delete: X | Slide: G | Reset: R | Undo: Ctrl+Z | "
+            f"Mirror: S ({state}) | Finish: Enter / Esc"
+        )
+
+    # -- mirror (the record's Symmetric switch, across its axis) ---------------
+    def mirror_world(self, w):
+        if not self.sym or self.target is None:
+            return Vector(w)
+        return plan.mirror_point(self.target, w, self.sym_axis)
+
+    def on_plane(self, w):
+        if not self.sym or self.target is None:
+            return Vector(w)
+        return plan.project_point(self.target, w, self.sym_axis)
+
+    def mirrored(self):
+        return self.sym and not self.closed and len(self.points) >= 2
+
+    def apply_mirror(self, index, world):
+        """Keep the partner control point the mirror of the one being edited."""
+        if not self.mirrored():
+            return
+        n = len(self.points)
+        partner = n - 1 - index
+        if partner == index:
+            self.points[index] = self.inv @ self.on_plane(world)  # the middle sits on the plane
+        elif 0 <= partner < n:
+            self.points[partner] = self.inv @ self.mirror_world(world)
+
+    def snap_to_mirror(self, world, coord):
+        """Snap a dragged point onto the mirror of another point when it is near one."""
+        if not self.mirrored():
+            return world
+        best, best_d = None, self.HOVER_PX
+        for j, wj in enumerate(self.world_points()):
+            if j == self.drag:
+                continue
+            target = self.to2d(self.mirror_world(wj))
+            if target is None:
+                continue
+            d = dist2d(target, coord)
+            if d < best_d:
+                best, best_d = self.mirror_world(wj), d
+        return best if best is not None else world
+
+    def insert_point(self, context, k, local):
+        """Insert a control point; with mirror on, its partner appears too. -> new index."""
+        if not self.mirrored():
+            self.points.insert(k, local)
+            return k
+        n0 = len(self.points)
+        world = self.mw @ local
+        if n0 - k == k:  # an odd cut grows a centre point that sits on the plane
+            self.points.insert(k, self.inv @ self.on_plane(world))
+            return k
+        mirror_local = self.inv @ self.mirror_world(world)
+        if k < n0 - k:
+            self.points.insert(n0 - k, mirror_local)
+            self.points.insert(k, local)
+            return k
+        self.points.insert(k, local)
+        self.points.insert(n0 - k, mirror_local)
+        return k + 1
+
+    def delete_point(self, index):
+        n = len(self.points)
+        partner = n - 1 - index
+        if self.mirrored() and partner != index and 0 <= partner < n:
+            for i in sorted((index, partner), reverse=True):
+                self.points.pop(i)
+        else:
+            self.points.pop(index)
 
     # -- helpers ----------------------------------------------------------------
     def world_points(self):
@@ -413,7 +687,9 @@ class ESP_OT_edit_surface(bpy.types.Operator):
         if event.type == 'MOUSEMOVE':
             if self.drag is not None:
                 w = self.surface_pos(context, self.mouse, self.mw @ self.points[self.drag])
+                w = self.snap_to_mirror(w, self.mouse)
                 self.points[self.drag] = self.inv @ w
+                self.apply_mirror(self.drag, w)
                 self.commit(context, draft=True)
             elif self.slide is not None:
                 start, base = self.slide
@@ -435,8 +711,7 @@ class ESP_OT_edit_surface(bpy.types.Operator):
                     seg = self.nearest_segment(self.mouse)
                     if seg is not None:
                         w = self.surface_pos(context, self.mouse, self.mw @ self.points[seg])
-                        self.points.insert(seg + 1, self.inv @ w)
-                        self.drag = seg + 1
+                        self.drag = self.insert_point(context, seg + 1, self.inv @ w)
                         self.commit(context)
                 elif self.hover is not None:
                     self.drag = self.hover
@@ -447,10 +722,15 @@ class ESP_OT_edit_surface(bpy.types.Operator):
         elif event.type in {'X', 'DEL'} and event.value == 'PRESS':
             min_pts = 3 if self.closed else 2
             if self.hover is not None and len(self.points) > min_pts:
-                self.points.pop(self.hover)
+                self.delete_point(self.hover)
                 self.hover = None
                 self.commit(context)
                 self.push_history()
+        elif event.type == 'S' and event.value == 'PRESS':
+            self.rec.symmetric = not self.rec.symmetric
+            self.sym = bool(self.rec.symmetric)
+            self.sym_axis = self.rec.symmetry_axis
+            self._status(context)
         elif event.type == 'G' and event.value == 'PRESS':
             self.slide = (self.mouse, [p.copy() for p in self.points])
         elif event.type == 'R' and event.value == 'PRESS':
@@ -475,6 +755,12 @@ class ESP_OT_edit_surface(bpy.types.Operator):
             return
         pts = [self.to2d(w) for w in self.world_points()]
         pts2 = [p for p in pts if p is not None]
+        if self.mirrored():
+            mit = [self.to2d(self.mirror_world(w)) for w in self.world_points()]
+            mit2 = [p for p in mit if p is not None]
+            if len(mit2) >= 2:
+                draw.lines_2d(mit2, draw.DIM, 1.5)  # where the mirrored line sits
+            draw.points_2d(mit2, draw.DIM, 6.0)
         if len(pts2) >= 2:
             draw.lines_2d(pts2, draw.GREEN, 2.0, closed=self.closed)
         draw.points_2d(pts2, draw.ORANGE, 8.0)
@@ -800,6 +1086,8 @@ CLASSES = (
     ESP_OT_select_pin,
     ESP_OT_add_connector,
     ESP_OT_remove_connector,
+    ESP_OT_rotate_subplane,
+    ESP_OT_align_subplanes,
     ESP_OT_refresh_pins,
     ESP_OT_edit_surface,
     ESP_OT_build,

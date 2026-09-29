@@ -284,6 +284,69 @@ def test_multiple_connectors():
     check(len(rec.connectors) == 1 and len(plan.contact_pins(rec)) == 2, "one extra connector removed")
 
 
+def _angled_record(ctx, obj, points, view):
+    built = plan.angled_surface(ctx, obj, points, view)
+    pv, pf, cv, cf, skipped = built
+    d = plan.ContactData('ANGLED')
+    d.points = points
+    d.view_dir = view
+    d.verts, d.faces = pv, pf
+    d.cutter = (cv, cf)
+    d.regions_skipped = skipped
+    d.hit = Vector((0.0, -10.0, 0.0))
+    d.through = view
+    d.anchor = points[0].copy()
+    rec = plan.add_record(ctx, obj, 'ANGLED', [d])
+    rec.add_pin = False
+    return rec
+
+
+def test_angled_subplane_rotation():
+    print("== an angled sub-plane leans, symmetric, and the build honours it")
+    sc = reset_scene()
+    obj = make_cylinder()
+    sc.esp.mode = 'PLAN'
+    ctx = bpy.context
+    points = [Vector((0, -22, 12)), Vector((0, 0, -4)), Vector((0, 22, 12))]
+    rec = _angled_record(ctx, obj, points, Vector((-1, 0, 0)))
+    sobj = bpy.data.objects[rec.surface_a]
+    check(not plan.segments_all_aligned(rec), "a fresh cut cuts by the view")
+    pin = bpy.data.objects.get(rec.pin_a)
+    before = pin.matrix_world.copy() if pin else None
+    plan.set_all_align(ctx, rec, True)
+    check(plan.segments_all_aligned(rec) and list(sobj.get("esp_align", [])) == [True, True],
+          "all sub-planes can be laid along the main normal at once")
+    if before is not None:
+        d = max(abs(pin.matrix_world[i][j] - before[i][j]) for i in range(4) for j in range(4))
+        check(d < 1e-5, f"aligning does not resize the connector ({d:.1e})")
+        auto = list(rec.pin_auto_a)
+        now = plan.flat(pin.matrix_world)
+        check(max(abs(a - b) for a, b in zip(auto, now)) < 1e-5, "and the kept pose becomes the new automatic one")
+    plan.set_segment_align(ctx, rec, 0, False)
+    check(list(sobj.get("esp_align", [])) == [False, True], "and one can be taken back off")
+    # the Edit-mode path: a supplied flat area becomes the source and sets the cut
+    plan.set_align_from_selection(ctx, rec, [(Vector((0.0, -15.0, 0.0)), Vector((0.0, 0.0, 1.0)), 100.0)])
+    cv, cf = plan.cutter_world_patch(sobj)
+    n_sel = surfaces.patch_normal(cv, [cf[0]])
+    check(list(sobj.get("esp_align", [])) == [True, True] and "esp_align_faces" in sobj,
+          "selecting faces turns every sub-plane on and stores them")
+    check(abs(n_sel.z) < 0.1, f"and the cut follows that flat area ({[round(c, 2) for c in n_sel]})")
+    plan.set_all_align(ctx, rec, False)
+    plan.clear_align_faces(rec)
+    rec.symmetric = True
+    rec.symmetry_axis = 'Y'  # the two side planes are mirrors across Y
+    ok = plan.set_segment_tilt(ctx, rec, 0, 0.2)
+    tilts = list(sobj.get("esp_tilt", []))
+    check(ok, "a segment tilt is accepted")
+    check(len(tilts) == 2 and abs(tilts[0] - 0.2) < 1e-6 and abs(tilts[1] + 0.2) < 1e-6,
+          f"the mirror segment leans the other way ({[round(t, 3) for t in tilts]})")
+    bpy.ops.esp.build()
+    check(sc.esp.built, "the leaned angled cut builds")
+    parts = list(bpy.data.collections.get(sc.esp.built_collection).objects)
+    closed = all(mesh_utils.manifold_report(o.data)[0] == 0 for o in parts)
+    check(len(parts) == 2 and closed, f"two closed parts ({len(parts)})")
+
+
 def test_plane_section_preview():
     """A plane cut's preview is the model's cross section, and it follows the plane."""
     print("== plane cut surface tracks the model's cross section")
@@ -885,6 +948,7 @@ if __name__ == "__main__":
     test_approve_keeps_unbuilt_cuts()
     test_two_contact_surfaces_edit_by_points()
     test_multiple_connectors()
+    test_angled_subplane_rotation()
     test_quick_mode()
     test_quick_plane_section()
     test_printer_fit()

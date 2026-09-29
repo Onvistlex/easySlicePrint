@@ -70,8 +70,21 @@ def source_bmesh(obj, depsgraph=None):
     if _cache["key"] != key or _cache["bm"] is None or now - _cache["time"] > CACHE_SECONDS:
         free_cache()
         bm = bmesh.new()
-        if depsgraph is not None:
+        if obj.mode == 'EDIT':
+            # an object being edited has no evaluated mesh of its own (from_object reads
+            # nothing), and the cut tools are used from Edit mode all the time; read the
+            # mesh data directly so a section still comes out
+            bm.from_mesh(obj.data)
+        elif depsgraph is not None:
             bm.from_object(obj, depsgraph)
+            if len(bm.verts) == 0 and len(obj.data.vertices) > 0:
+                # the evaluated mesh can come back empty when the depsgraph has not been
+                # run yet (scripted or mid-update calls). Nudge it and read again, so an
+                # empty mesh never poisons the section cache for the next few seconds.
+                depsgraph.update()
+                bm.free()
+                bm = bmesh.new()
+                bm.from_object(obj, depsgraph)
         else:
             bm.from_mesh(obj.data)
         bm.transform(obj.matrix_world)

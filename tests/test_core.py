@@ -230,6 +230,84 @@ def test_angled_cut():
     return obj
 
 
+def test_angled_tilt():
+    print("== an angled sub-plane can lean without moving the line")
+    reset_scene()
+    obj = make_cylinder()
+    points = [Vector((0, -22, 12)), Vector((0, 0, -4)), Vector((0, 22, 12))]
+    view = Vector((-1, 0, 0))
+    base = plan.angled_surface(bpy.context, obj, points, view)
+    leaned = plan.angled_surface(bpy.context, obj, points, view, tilts=[0.3, 0.0])
+    check(base is not None and leaned is not None, "both the square and the leaned surface build")
+    n_base = surfaces.patch_normal(base[2], [base[3][0]])
+    n_leaned = surfaces.patch_normal(leaned[2], [leaned[3][0]])
+    check(n_base.dot(n_leaned) < 0.999, f"leaning the first segment turns its plane ({n_base.dot(n_leaned):.3f})")
+    n_second = surfaces.patch_normal(leaned[2], [leaned[3][1]])
+    check(abs(n_second.dot(surfaces.patch_normal(base[2], [base[3][1]]))) > 0.999, "the second segment is left alone")
+    spec = cutting.CutSpec(contacts=[cutting.ContactSpec(leaned[2], leaned[3], add_pin=False)], gap=0.2)
+    a, b, _secs = cutting.perform_cut(bpy.context, obj, spec, ("UP", "DOWN"), out_collection("out"))
+    check(is_closed_manifold(a.data) and is_closed_manifold(b.data), "the leaned cut still gives two closed parts")
+    return obj
+
+
+def test_align_to_main_normal():
+    print("== a sub-plane can cut along the main normal of the surface")
+    reset_scene()
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=20.0)
+    obj = make_object("Cube", bm)
+    view = Vector((0, -1, 0))
+    points = [Vector((-14, 0, 10)), Vector((14, 0, 10))]  # along the top face, past both edges
+    default = plan.angled_surface(bpy.context, obj, points, view)
+    aligned = plan.angled_surface(bpy.context, obj, points, view, align=[True])
+    check(default is not None and aligned is not None, "both surfaces build")
+    nd = surfaces.patch_normal(default[2], [default[3][0]])
+    na = surfaces.patch_normal(aligned[2], [aligned[3][0]])
+    check(abs(nd.z) > 0.9, f"by default the plane follows the view (normal {[round(c, 2) for c in nd]})")
+    check(abs(na.z) < 0.1 and abs(na.y) > 0.9,
+          f"aligned, it holds the top face normal ({[round(c, 2) for c in na]})")
+    # a supplied flat area (the Edit-mode selection path) is the only source then
+    faces = [(Vector((0.0, 0.0, 10.0)), Vector((0.0, 0.0, 1.0)), 400.0)]
+    picked = plan.angled_surface(bpy.context, obj, points, view, align=[True], align_faces=faces)
+    npick = surfaces.patch_normal(picked[2], [picked[3][0]])
+    check(abs(npick.z) < 0.1 and abs(npick.y) > 0.9, "a supplied flat area sets the normal too")
+    spec = cutting.CutSpec(contacts=[cutting.ContactSpec(aligned[2], aligned[3], add_pin=False)], gap=0.2)
+    a, b, _secs = cutting.perform_cut(bpy.context, obj, spec, ("A", "B"), out_collection("out"))
+    check(is_closed_manifold(a.data) and is_closed_manifold(b.data), "the aligned cut gives two closed parts")
+    return obj
+
+
+def test_align_sides_pair_by_side():
+    print("== two sub-planes take the flat area on their own side")
+    reset_scene()
+    samples = [
+        (Vector((-8.0, 0.0, 0.0)), Vector((-0.75, 0.5, -0.4)).normalized(), 100.0),
+        (Vector((8.0, 0.0, 0.0)), Vector((0.75, 0.5, -0.4)).normalized(), 100.0),
+    ]
+    sym = (Vector((0.0, 0.0, 0.0)), Vector((1.0, 0.0, 0.0)))
+    left = plan._pick_align_normal(Vector((-8.0, 0.0, 0.0)), Vector((-8.0, 10.0, 0.0)), samples, sym)
+    right = plan._pick_align_normal(Vector((8.0, 0.0, 0.0)), Vector((8.0, 10.0, 0.0)), samples, sym)
+    check(left is not None and left.x < 0.0, f"the left segment takes the left area ({[round(c, 2) for c in left]})")
+    check(
+        right is not None and right.x > 0.0,
+        f"the right segment takes the right area ({[round(c, 2) for c in right]})",
+    )
+    check(abs(left.x + right.x) < 1e-6 and abs(left.y - right.y) < 1e-6, "and the two normals mirror")
+    # a segment on the symmetry plane has no side: the nearest area wins
+    central = plan._pick_align_normal(Vector((0.0, 0.0, 0.0)), Vector((0.0, 10.0, 0.0)), samples, sym)
+    check(central is not None, "a central segment still finds an area")
+
+
+def test_mirror_helpers():
+    print("== mirror a point and drop it on the symmetry plane")
+    reset_scene()
+    obj = make_cylinder()  # at the origin, so its X = 0 plane is the mirror
+    m = plan.mirror_point(obj, Vector((-25.0, 3.0, 1.0)), 'X')
+    check((m - Vector((25.0, 3.0, 1.0))).length < 1e-6, f"a point mirrors across X ({[round(c, 2) for c in m]})")
+    q = plan.project_point(obj, Vector((7.0, 5.0, 2.0)), 'X')
+    check(abs(q.x) < 1e-6 and abs(q.y - 5.0) < 1e-6, "a point drops onto the symmetry plane")
+
+
 def test_ribbon_cut():
     print("== curved (ribbon) cut")
     reset_scene()
@@ -1356,6 +1434,10 @@ if __name__ == "__main__":
     test_icons_are_valid()
     test_multiple_connectors_on_one_cut()
     test_angled_cut()
+    test_angled_tilt()
+    test_align_to_main_normal()
+    test_align_sides_pair_by_side()
+    test_mirror_helpers()
     test_ribbon_cut()
     test_loop_cut()
     test_smooth_surfaces()

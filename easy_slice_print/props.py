@@ -246,6 +246,21 @@ class ESP_CutRecord(bpy.types.PropertyGroup):
     # Extra connectors on top of the one each contact is born with (the record's own
     # `pin_a`/`pin_b`); see ESP_Connector.
     connectors: CollectionProperty(type=ESP_Connector)
+    # angled cuts: lean a sub-plane on one side and its mirror segment leans the other way
+    symmetric: BoolProperty(
+        name="Symmetric",
+        default=False,
+        description="Mirror a sub-plane tilt onto the matching segment on the other side",
+    )
+    symmetry_axis: EnumProperty(
+        name="Axis",
+        items=[
+            ('X', "X", "Mirror across the model's X = 0 plane"),
+            ('Y', "Y", "Mirror across the model's Y = 0 plane"),
+            ('Z', "Z", "Mirror across the model's Z = 0 plane"),
+        ],
+        default='X',
+    )
     built: BoolProperty(default=False)
 
 

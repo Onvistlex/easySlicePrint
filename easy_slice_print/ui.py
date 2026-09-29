@@ -270,6 +270,16 @@ class ESP_PT_plan(ESPPanel, bpy.types.Panel):
             row = box.row(align=True)
             row.operator("esp.add_connector", text="Add Connector", icon='ADD')
             row.operator("esp.reset_pin", text="Reset All", icon='LOOP_BACK')
+            if rec.cut_type == 'ANGLED':
+                row = box.row(align=True)
+                row.operator("esp.rotate_subplane", text="Rotate Sub-planes", icon='FILE_REFRESH')
+                row.operator("esp.align_subplanes", text="Main Normal", icon='CONSTRAINT')
+                row = box.row(align=True)
+                row.prop(rec, "symmetric", toggle=True, icon='MOD_MIRROR')
+                if rec.symmetric:
+                    row.prop(rec, "symmetry_axis", text="")
+                    box.label(text="The mirror segment leans the other way", icon='INFO')
+                box.label(text="Smooth: fit the surface. Edit mode: fit the selected faces", icon='INFO')
             box.label(text="Tab into a connector to reshape it; Build follows it", icon='INFO')
         if s.built:
             row = layout.row(align=True)

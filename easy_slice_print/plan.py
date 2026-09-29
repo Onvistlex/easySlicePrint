@@ -51,6 +51,8 @@ class ContactData:
         self.cutter = None  # what the boolean subtracts, when it is not the patch itself
         self.is_cut_face = False  # the patch is the real printed cut face, edge to edge
         self.regions_skipped = 0  # regions the plane crosses that the stroke missed
+        self.tilt = []  # angled cuts: per-segment rotation about the drawn line (radians)
+        self.align = []  # angled cuts: per-segment, take the plane normal from the local face
 
 
 # ----------------------------------------------------------------------------
@@ -231,7 +233,108 @@ def fill_straight_contact(data, patch, span):
     data.regions_skipped = patch.islands - patch.kept
 
 
-def angled_surface(context, target, points, view_dir, reference=None):
+def region_face_normal_from_mesh(mesh, a, b, radius):
+    """Area-weighted normal of the largest flat area within `radius` of the segment.
+
+    The model's faces near the drawn line are grouped by normal (a flat area is many
+    triangles that share one normal); the group with the most area wins, so the plane can
+    be laid along the surface the cut runs through. -> unit Vector or None.
+    """
+    a, b = Vector(a), Vector(b)
+    groups = []  # [normal, area, area-weighted normal]
+    for poly in mesh.polygons:
+        if _point_segment_distance(poly.center, a, b) > radius:
+            continue
+        nrm, area = poly.normal, poly.area
+        for g in groups:
+            if g[0].dot(nrm) > 0.999:
+                g[1] += area
+                g[2] += nrm * area
+                break
+        else:
+            groups.append([nrm.copy(), area, nrm * area])
+    if not groups:
+        return None
+    best = max(groups, key=lambda g: g[1])
+    return best[2].normalized() if best[2].length > 1e-9 else None
+
+
+def face_selection_samples(target):
+    """(centroid_world, normal_world, area) for the target's selected faces, or [].
+
+    Read while the target is in Edit mode; this is the "select the geometry that should
+    win the main-normal race" path, so the user says exactly which flat area to use.
+    """
+    if bpy.context.mode != 'EDIT_MESH' or bpy.context.object is not target:
+        return []
+    import bmesh
+
+    bm = bmesh.from_edit_mesh(target.data)
+    mw = target.matrix_world
+    nrm_mat = mw.to_3x3().inverted_safe().transposed()
+    out = []
+    for f in bm.faces:
+        if not f.select:
+            continue
+        out.append((mw @ f.calc_center_median(), (nrm_mat @ f.normal).normalized(), f.calc_area()))
+    return out
+
+
+def _align_faces_from_prop(obj):
+    raw = list(obj.get("esp_align_faces", []))
+    out = []
+    for k in range(0, len(raw) - 6, 7):
+        centre = Vector((raw[k], raw[k + 1], raw[k + 2]))
+        normal = Vector((raw[k + 3], raw[k + 4], raw[k + 5]))
+        out.append((centre, normal, float(raw[k + 6])))
+    return out
+
+
+def _pick_align_normal(a, b, samples, symmetry=None):
+    """Normal of the selected flat area for this segment.
+
+    When the model is symmetric and the segment sits on one side, only areas on the same
+    side are considered, so a sub-plane on the left takes the left area and one on the
+    right takes the right one - which is what makes the two mirror. A segment on the
+    symmetry plane itself has no side, and the nearest area wins.
+    """
+    groups = []  # [normal, area, weighted, centroids]
+    for c, n, area in samples:
+        for g in groups:
+            if g[0].dot(n) > 0.999:
+                g[1] += area
+                g[2] += n * area
+                g[3].append(c)
+                break
+        else:
+            groups.append([n.copy(), area, n * area, [c]])
+    if not groups:
+        return None
+    pool = groups
+    if symmetry is not None:
+        origin, normal = symmetry
+        side = (Vector((0.0, 0.0, 0.0)) + (Vector(a) + Vector(b)) * 0.5 - origin).dot(normal)
+        if abs(side) > 1e-6:
+            want = 1.0 if side > 0.0 else -1.0
+            sided = []
+            for g in groups:
+                gside = sum((c - origin).dot(normal) for c in g[3])
+                if gside * want > 0.0:
+                    sided.append(g)
+            if sided:
+                pool = sided
+    best, best_key = None, None
+    for g in pool:
+        dmin = min(_point_segment_distance(c, Vector(a), Vector(b)) for c in g[3])
+        key = (dmin, -g[1])
+        if best_key is None or key < best_key:
+            best, best_key = g, key
+    return best[2].normalized() if best and best[2].length > 1e-9 else None
+
+
+def angled_surface(
+    context, target, points, view_dir, reference=None, tilts=None, align=None, align_faces=None, sym_axis=None
+):
     """One cut surface made of linked plane segments (hard edges, no rounding).
 
     Each drawn segment defines a plane exactly like a Plane cut - the segment and the
@@ -240,6 +343,15 @@ def angled_surface(context, target, points, view_dir, reference=None):
     the drawn line bends and is otherwise as flat as a plane cut. The whole thing is one
     surface: subtracting its kerf splits the model in two along an angled seam, which is
     what a chain of separate Plane records cannot do (they leave extra parts).
+
+    `tilts` (radians, one per segment) rotates a segment's plane about its own drawn
+    line, so a single plane can lean without moving the line: the axis stays put and
+    only the cut face turns. A fresh angled cut has none (all zero).
+
+    `align` (bool, one per segment) makes a segment take its plane from the model: the
+    biggest flat area near the drawn line gives a normal, and the plane is laid along it
+    (the plane holds both the line and that normal, so it meets the surface square). A
+    mirrored side finds its own - mirrored - flat area, so two sides come out symmetric.
 
     Segment normals are oriented consistently (each agrees with the first), so "side A"
     means the same side along the whole surface. -> (preview_v, preview_f, cutter_v,
@@ -257,6 +369,8 @@ def angled_surface(context, target, points, view_dir, reference=None):
     pts = clean
     if len(pts) < 2:
         return None
+    tilts = list(tilts) if tilts else []
+    align = list(align) if align else []
     mn, mx = mesh_utils.object_world_bounds(target)
     diag = max((mx - mn).length, 1e-6)
     reach = diag * 1.5  # far enough along the view direction to leave the model behind
@@ -270,43 +384,90 @@ def angled_surface(context, target, points, view_dir, reference=None):
     normals = []
     flip = []
     base_n = None
-    for i in range(len(pts) - 1):
-        axis = (pts[i + 1] - pts[i]).normalized()
-        n = axis.cross(d)
-        if n.length < 1e-9:  # a segment drawn along the view direction has no plane
-            axes.append(None)
-            normals.append(None)
-            flip.append(False)
-            continue
-        n.normalize()
-        f = False
-        if base_n is None:
-            base_n = n.copy()
-        elif n.dot(base_n) < 0.0:
-            n = -n
-            f = True
-        axes.append(axis)
-        normals.append(n)
-        flip.append(f)
+    symmetry = None
+    if sym_axis:
+        local = {'X': (1.0, 0.0, 0.0), 'Y': (0.0, 1.0, 0.0), 'Z': (0.0, 0.0, 1.0)}.get(sym_axis)
+        if local is not None:
+            mw = target.matrix_world
+            symmetry = (mw.translation.copy(), (mw.to_3x3() @ Vector(local)).normalized())
+    need_mesh = any(align) and not align_faces
+    shared = mesh_utils.world_mesh_copy(context, target, "_esp_align") if need_mesh else None
+    try:
+        for i in range(len(pts) - 1):
+            axis = (pts[i + 1] - pts[i]).normalized()
+            n = axis.cross(d)
+            if n.length < 1e-9:  # a segment drawn along the view direction has no plane
+                axes.append(None)
+                normals.append(None)
+                flip.append(False)
+                continue
+            n.normalize()
+            if i < len(align) and align[i]:
+                # lay the plane along the surface: keep the drawn line and take a flat
+                # area's normal as the direction the cut runs into the model. When the
+                # user selected the area (Edit mode), that selection is the only source;
+                # otherwise the biggest flat area near the line wins.
+                face_n = None
+                if align_faces:
+                    face_n = _pick_align_normal(pts[i], pts[i + 1], align_faces, symmetry)
+                elif shared is not None:
+                    face_n = region_face_normal_from_mesh(shared, pts[i], pts[i + 1], diag * 0.1)
+                if face_n is not None:
+                    nn = axis.cross(face_n)
+                    if nn.length > 1e-6:
+                        n = nn.normalized()
+            tilt = tilts[i] if i < len(tilts) else 0.0
+            if abs(tilt) > 1e-9:
+                n = (Matrix.Rotation(tilt, 4, axis) @ n).normalized()
+            flipped = False
+            if base_n is None:
+                base_n = n.copy()
+            elif n.dot(base_n) < 0.0:
+                n = -n
+                flipped = True
+            axes.append(axis)
+            normals.append(n)
+            flip.append(flipped)
+    finally:
+        if shared is not None:
+            mesh_utils.remove_mesh(shared)
 
-    # the cutter: the strip each segment sweeps along the view direction. The two rails
-    # of the strip are shared between neighbours, so the wall is one continuous bent sheet.
+    # the cutter: a continuous sheet through the drawn points, its rails shared between
+    # neighbours so it stays one open surface (separate boxes only touch and the boolean
+    # leaves the halves joined). At an interior point the rail runs along the crease where
+    # the two planes meet - a line that lies in both - so every segment's quad stays
+    # planar even when a plane leans. A rail from the average of the two reach directions
+    # would instead give a twisted facet the kerf slab folds over, and the cut would fail.
+    rails = []
+    for i in range(len(pts)):
+        if i == 0 or normals[i - 1] is None:
+            r = normals[i].cross(axes[i])
+        elif i == len(pts) - 1 or normals[i] is None:
+            r = normals[i - 1].cross(axes[i - 1])
+        else:
+            ref = normals[i - 1].cross(axes[i - 1]) + normals[i].cross(axes[i])
+            r = normals[i - 1].cross(normals[i])
+            if r.length < 1e-9:
+                r = ref
+            elif r.dot(ref) < 0.0:
+                r = -r
+        rails.append(r.normalized() if r.length > 1e-9 else d.copy())
     cv = []
     ni = []
     fi = []
-    for p in pts:
+    for i, p in enumerate(pts):
         ni.append(len(cv))
-        cv.append(p - d * reach)
+        cv.append(p - rails[i] * reach)
         fi.append(len(cv))
-        cv.append(p + d * reach)
+        cv.append(p + rails[i] * reach)
     cf = []
     for i in range(len(pts) - 1):
         if normals[i] is None:
             continue
-        if flip[i]:
-            cf.append((ni[i], fi[i], fi[i + 1], ni[i + 1]))
-        else:
-            cf.append((ni[i], ni[i + 1], fi[i + 1], fi[i]))
+        face = (ni[i], ni[i + 1], fi[i + 1], fi[i])
+        if (cv[ni[i + 1]] - cv[ni[i]]).cross(cv[fi[i + 1]] - cv[ni[i]]).dot(normals[i]) < 0.0:
+            face = tuple(reversed(face))  # keep the cutter's own normal on side A
+        cf.append(face)
 
     # the visible cut face: the model's own cross section on each segment's plane
     pv, pf = [], []
@@ -489,6 +650,10 @@ def create_surface_object(context, name, data, target=None):
         obj["esp_through"] = list(data.through)
     if data.center_hint is not None:
         obj["esp_center_hint"] = list(data.center_hint)
+    if data.kind == 'ANGLED':
+        # per-segment rotation about the drawn line; empty means every plane is square
+        obj["esp_tilt"] = [float(t) for t in (data.tilt or [])]
+        obj["esp_align"] = [bool(a) for a in (data.align or [])]
     obj["esp_cut_face"] = data.is_cut_face
     set_cutter(obj, [Vector(p) - origin for p in data.cutter[0]] if data.cutter else None, data.cutter)
     obj["esp_mw"] = [v for row in obj.matrix_world for v in row]
@@ -502,6 +667,177 @@ def surface_points(obj):
 
 def set_surface_points(obj, points):
     obj["esp_points"] = [c for p in points for c in p]
+
+
+# ----------------------------------------------------------------------------
+# symmetry of an angled cut's sub-planes
+# ----------------------------------------------------------------------------
+def record_target(rec):
+    return bpy.data.objects.get(rec.target) or bpy.data.objects.get(bpy.context.scene.esp.base_object)
+
+
+def mirror_point(target, p, axis='X'):
+    mw = target.matrix_world
+    local = mw.inverted_safe() @ Vector(p)
+    setattr(local, axis.lower(), -getattr(local, axis.lower()))
+    return mw @ local
+
+
+def project_point(target, p, axis='X'):
+    """Drop a point onto the mirror plane (its coordinate on `axis` becomes zero)."""
+    mw = target.matrix_world
+    local = mw.inverted_safe() @ Vector(p)
+    setattr(local, axis.lower(), 0.0)
+    return mw @ local
+
+
+def segment_partner(target, points, index, axis='X'):
+    """The segment that is the mirror of `index`, by geometry (or None)."""
+    if len(points) < 2 or not (0 <= index < len(points) - 1):
+        return None
+    mid = (Vector(points[index]) + Vector(points[index + 1])) * 0.5
+    wanted = mirror_point(target, mid, axis)
+    mn, mx = mesh_utils.object_world_bounds(target)
+    tol = max((mx - mn).length * 0.06, 1e-6)
+    best, best_d = None, tol
+    for j in range(len(points) - 1):
+        jmid = (Vector(points[j]) + Vector(points[j + 1])) * 0.5
+        d = (jmid - wanted).length
+        if d < best_d:
+            best, best_d = j, d
+    return best
+
+
+def set_segment_tilt(context, rec, index, angle):
+    """Lean one segment's plane about its own drawn line; mirrors the partner when symmetric."""
+    sobj = bpy.data.objects.get(rec.surface_a)
+    target = record_target(rec)
+    if sobj is None or target is None:
+        return False
+    pts = surface_points(sobj)
+    n_seg = max(0, len(pts) - 1)
+    if not (0 <= index < n_seg):
+        return False
+    tilts = list(sobj.get("esp_tilt", []))
+    tilts += [0.0] * (n_seg - len(tilts))
+    tilts = tilts[:n_seg]
+    tilts[index] = float(angle)
+    if rec.symmetric:
+        world = [sobj.matrix_basis @ p for p in pts]
+        partner = segment_partner(target, world, index, rec.symmetry_axis)
+        if partner is not None and partner != index:
+            tilts[partner] = -float(angle)  # a mirrored leaning plane leans the other way
+    sobj["esp_tilt"] = tilts
+    _rebuild_keep_pins(context, rec, sobj, target)
+    return True
+
+
+def _align_list(sobj, n_seg):
+    align = list(sobj.get("esp_align", []))
+    align += [False] * (n_seg - len(align))
+    return align[:n_seg]
+
+
+def _pin_matrices(rec):
+    """Every connector preview's world matrix, so a plane change can leave it alone."""
+    out = {}
+    for i in range(contact_count(rec)):
+        obj = bpy.data.objects.get(_contact_attr(rec, "pin", i))
+        if obj is not None:
+            out[obj.name] = obj.matrix_world.copy()
+    for k in rec.connectors:
+        obj = bpy.data.objects.get(k.pin)
+        if obj is not None:
+            out[obj.name] = obj.matrix_world.copy()
+    return out
+
+
+def _rebuild_keep_pins(context, rec, sobj, target):
+    """Take the surface again after a tilt/align change, then put every connector back.
+
+    Re-sectioning resizes the primary connector (its size comes from the section's
+    inscribed circle), so aligning a plane used to blow the pin up. Leaning or aligning a
+    plane is not a request to re-fit the connector, so it keeps the spot and size it had;
+    Reset Connector is the way back to the automatic fit.
+    """
+    mats = _pin_matrices(rec)
+    rebuild_surface(sobj, context=context, target=target)
+    refresh_record_frames(context, rec)
+    for i in range(contact_count(rec)):
+        obj = bpy.data.objects.get(_contact_attr(rec, "pin", i))
+        if obj is not None and obj.name in mats:
+            obj.matrix_world = mats[obj.name]
+            # the preserved pose becomes the new automatic one, so the size the user sees
+            # is what later settings changes keep (no drift as the section changes)
+            _set_contact_attr(rec, "pin_auto", i, flat(obj.matrix_world))
+    for k in rec.connectors:
+        obj = bpy.data.objects.get(k.pin)
+        if obj is not None and obj.name in mats:
+            obj.matrix_world = mats[obj.name]
+            k.pin_auto = flat(obj.matrix_world)
+
+
+def set_segment_align(context, rec, index, value):
+    """Cut one segment's plane along the local surface's main normal (or back to view)."""
+    sobj = bpy.data.objects.get(rec.surface_a)
+    target = record_target(rec)
+    if sobj is None or target is None:
+        return False
+    n_seg = max(0, len(surface_points(sobj)) - 1)
+    if not (0 <= index < n_seg):
+        return False
+    align = _align_list(sobj, n_seg)
+    align[index] = bool(value)
+    if rec.symmetric:
+        world = [sobj.matrix_basis @ p for p in surface_points(sobj)]
+        partner = segment_partner(target, world, index, rec.symmetry_axis)
+        if partner is not None and partner != index:
+            align[partner] = bool(value)
+    sobj["esp_align"] = align
+    _rebuild_keep_pins(context, rec, sobj, target)
+    return True
+
+
+def set_all_align(context, rec, value):
+    sobj = bpy.data.objects.get(rec.surface_a)
+    target = record_target(rec)
+    if sobj is None or target is None:
+        return False
+    n_seg = max(0, len(surface_points(sobj)) - 1)
+    sobj["esp_align"] = [bool(value)] * n_seg
+    _rebuild_keep_pins(context, rec, sobj, target)
+    return True
+
+
+def segments_all_aligned(rec):
+    sobj = bpy.data.objects.get(rec.surface_a)
+    if sobj is None:
+        return False
+    align = list(sobj.get("esp_align", []))
+    return bool(align) and all(align)
+
+
+def set_align_from_selection(context, rec, samples):
+    """Cut every sub-plane along the flat area the user selected (Edit mode)."""
+    sobj = bpy.data.objects.get(rec.surface_a)
+    target = record_target(rec)
+    if sobj is None or target is None or not samples:
+        return False
+    flat = []
+    for c, n, area in samples:
+        flat.extend((c.x, c.y, c.z, n.x, n.y, n.z, area))
+    sobj["esp_align_faces"] = flat
+    sobj["esp_sym_axis"] = rec.symmetry_axis  # so per-segment pairing can mirror
+    n_seg = max(0, len(surface_points(sobj)) - 1)
+    sobj["esp_align"] = [True] * n_seg
+    _rebuild_keep_pins(context, rec, sobj, target)
+    return True
+
+
+def clear_align_faces(rec):
+    sobj = bpy.data.objects.get(rec.surface_a)
+    if sobj is not None and "esp_align_faces" in sobj:
+        del sobj["esp_align_faces"]
 
 
 def _clear_point(target, p, margin, depsgraph):
@@ -790,7 +1126,19 @@ def rebuild_surface(obj, draft=False, context=None, target=None):
             return
         mw = obj.matrix_basis
         world_view = Vector(obj["esp_view"]).normalized()
-        built = angled_surface(context, target, [mw @ p for p in pts], world_view)
+        tilts = list(obj.get("esp_tilt", []))
+        align = list(obj.get("esp_align", []))
+        align_faces = _align_faces_from_prop(obj)
+        built = angled_surface(
+            context,
+            target,
+            [mw @ p for p in pts],
+            world_view,
+            tilts=tilts,
+            align=align,
+            align_faces=align_faces,
+            sym_axis=obj.get("esp_sym_axis"),
+        )
         if built is None:
             return
         pv, pf, cv, cf, skipped = built
@@ -799,6 +1147,10 @@ def rebuild_surface(obj, draft=False, context=None, target=None):
         faces = pf
         set_cutter(obj, [inv @ Vector(p) for p in cv] if cv else None, (cv, cf) if cv else None)
         obj["esp_skipped"] = skipped
+        # the drawn line may have gained or lost a point: keep one tilt/align per segment
+        n_seg = max(0, len(pts) - 1)
+        obj["esp_tilt"] = [float(tilts[i]) if i < len(tilts) else 0.0 for i in range(n_seg)]
+        obj["esp_align"] = [bool(align[i]) if i < len(align) else False for i in range(n_seg)]
     elif kind == 'STRAIGHT':
         patch = rebuilt_section(obj, context, target)
         if patch is None:
