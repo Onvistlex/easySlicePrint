@@ -368,6 +368,34 @@ def _clip_patch_rect(verts, faces, origin, u, v, u0, u1, v0=None, v1=None):
     return (out_v, out_f) if out_f else None
 
 
+def _weld_by_pos(verts, faces, tol):
+    """Merge vertices that sit within `tol` of each other and drop collapsed faces."""
+    cell = tol if tol > 1e-9 else 1e-9
+    key = {}
+    remap = []
+    out_v = []
+    for v in verts:
+        k = (round(v.x / cell), round(v.y / cell), round(v.z / cell))
+        idx = key.get(k)
+        if idx is None:
+            idx = len(out_v)
+            key[k] = idx
+            out_v.append(v)
+        remap.append(idx)
+    out_f = []
+    for f in faces:
+        rf = []
+        for idx in f:
+            r = remap[idx]
+            if not rf or rf[-1] != r:
+                rf.append(r)
+        if len(rf) > 2 and rf[0] == rf[-1]:
+            rf.pop()
+        if len(rf) > 2:
+            out_f.append(tuple(rf))
+    return out_v, out_f
+
+
 def angled_surface(
     context,
     target,
@@ -633,6 +661,19 @@ def angled_surface(
         pv.extend(sv)
         pf.extend(tuple(base + idx for idx in f) for f in sf)
         skipped += int(patch.islands - patch.kept)
+    if trim_line and seg_wall:
+        # close the gap at each bend: a face joining one segment's wall edge to the next
+        # segment's, then weld the coincident edge vertices so the cut face is one sheet
+        for i in range(len(pts) - 2):
+            w0, w1 = seg_wall[i], seg_wall[i + 1]
+            if normals[i] is None or normals[i + 1] is None or w0 is None or w1 is None:
+                continue
+            b = pts[i + 1]
+            r0, r1 = seg_r[i], seg_r[i + 1]
+            base = len(pv)
+            pv.extend((b + r0 * w0[0], b + r0 * w0[1], b + r1 * w1[1], b + r1 * w1[0]))
+            pf.append((base, base + 1, base + 2, base + 3))
+        pv, pf = _weld_by_pos(pv, pf, diag * 1e-4)
     if not cf or not pf:
         return None
     return pv, pf, cv, cf, skipped
